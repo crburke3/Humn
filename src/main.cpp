@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <Wire.h>
+#include <Preferences.h>
 #include <Adafruit_DRV2605.h>
 #include <RadioLib.h>
 #include <Adafruit_GFX.h>
@@ -35,7 +36,9 @@ static const uint32_t BTN_HOLD_MS = 700;
 enum UiSetting : uint8_t {
   UI_VIBE = 0,
   UI_PING = 1,
-  UI_FEEDBACK = 2
+  UI_FEEDBACK = 2,
+  UI_SIM = 3,
+  UI_SCALE = 4
 };
 
 // Status LED
@@ -74,11 +77,13 @@ static uint32_t nextPingMs = 0;
 static uint32_t pingCounter = 0;
 static uint32_t lastPingSentMs = 0;
 static uint32_t pingIntervalLogEvery = 10;
+static uint32_t rxLogEvery = 10;
+static uint32_t rxCounter = 0;
 static int16_t lastRssi = 0;
 static float lastSnr = 0.0f;
 static uint32_t motorStopMs = 0;
 static bool drvOk = false;
-static uint8_t intensityMode = 0; // 0=soft,1=medium,2=hard,3=max
+static uint8_t intensityMode = 1; // 0=soft,1=medium,2=hard,3=max
 static uint32_t lastBtnMs = 0;
 static bool lastBtnState = false;
 static uint32_t btnPressStartMs = 0;
@@ -86,14 +91,15 @@ static bool btnHoldHandled = false;
 static uint32_t ledOffMs = 0;
 static bool ledOn = false;
 static uint8_t uiSetting = UI_VIBE;
-static bool feedbackConstant = true;
+enum FeedbackMode : uint8_t { FEEDBACK_PULSED_RATE = 0, FEEDBACK_PULSE_ON_RX = 1, FEEDBACK_CONSTANT = 2 };
+static FeedbackMode feedbackMode = FEEDBACK_PULSED_RATE;
 static TaskHandle_t vibeTaskHandle = nullptr;
 static volatile bool requestHapticPulse = false;
 static volatile int requestHapticStep = 0;
 static uint32_t lastRxMs = 0;
 static const uint32_t PING_RATES_MS[] = {1000, 800, 600, 400, 300, 200, 100, 50};
 static uint8_t pingRateIndex = 0;
-static uint32_t pingBaseMs = 300;
+static uint32_t pingBaseMs = 100;
 static uint32_t pingJitterMs = 100;
 static const uint32_t PING_LATE_WARN_MS = 50;
 
@@ -105,6 +111,35 @@ static Role role = ROLE_SEARCH;
 static uint32_t deviceId = 0;
 static uint32_t peerId = 0;
 static uint32_t lastPeerSeenMs = 0;
+static Preferences prefs;
+static bool simulateDistance = false;
+static uint8_t distanceScaleIndex = 10; // 10 = 1.0x
+
+void saveSettings() {
+  prefs.putUChar("intensity", intensityMode);
+  prefs.putUChar("pingIdx", pingRateIndex);
+  prefs.putUChar("feedback", (uint8_t)feedbackMode);
+  prefs.putUChar("ui", uiSetting);
+  prefs.putBool("sim", simulateDistance);
+  prefs.putUChar("scale", distanceScaleIndex);
+}
+
+void loadSettings() {
+  intensityMode = prefs.getUChar("intensity", 1);
+  pingRateIndex = prefs.getUChar("pingIdx", 6);
+  feedbackMode = (FeedbackMode)prefs.getUChar("feedback", (uint8_t)FEEDBACK_PULSED_RATE);
+  uiSetting = prefs.getUChar("ui", (uint8_t)UI_VIBE);
+  simulateDistance = prefs.getBool("sim", false);
+  distanceScaleIndex = prefs.getUChar("scale", 10);
+  if (distanceScaleIndex < 1) distanceScaleIndex = 1;
+  if (distanceScaleIndex > 20) distanceScaleIndex = 20;
+
+  if (pingRateIndex >= (sizeof(PING_RATES_MS) / sizeof(PING_RATES_MS[0]))) {
+    pingRateIndex = 0;
+  }
+  pingBaseMs = PING_RATES_MS[pingRateIndex];
+  pingJitterMs = max<uint32_t>(10, pingBaseMs / 4);
+}
 static const uint32_t VIBE_TIMEOUT_MS = 5000;
 static uint32_t nextVibeToggleMs = 0;
 static int lastStep = 19;
@@ -117,11 +152,27 @@ static const float INTERVAL_SMOOTH_ALPHA = 0.20f;
 // Watchdog: re-enter RX mode if we go quiet
 static const uint32_t RX_WATCHDOG_MS = 3000;
 
+static int lastDisplayStep = -1;
+static uint32_t lastSimUpdateMs = 0;
+static const uint32_t SIM_UPDATE_MS = 500;
+
+// Simulation mode: cycles distance without RF (user-toggle)
+static const uint32_t SIM_PHASE_MS = 10000;
+static const uint32_t SIM_CYCLE_MS = SIM_PHASE_MS * 3;
+
 void setLoraFlag() {
   if (!loraInterruptEnabled) {
     return;
   }
   loraRxFlag = true;
+}
+
+int applyDistanceScale(int step) {
+  float scale = distanceScaleIndex / 10.0f;
+  int scaled = (int)round(step * scale);
+  if (scaled < 0) scaled = 0;
+  if (scaled > 19) scaled = 19;
+  return scaled;
 }
 
 int estimateDistanceStep(int16_t rssiDbm) {
@@ -138,7 +189,7 @@ int estimateDistanceStep(int16_t rssiDbm) {
   int step = (int)round(normalized * 19.0f);
   if (step < 0) step = 0;
   if (step > 19) step = 19;
-  return step;
+  return applyDistanceScale(step);
 }
 
 const char* distanceLabel(int step) {
@@ -159,38 +210,102 @@ const char* intensityLabel(uint8_t mode) {
 }
 
 void updateIntensityDisplay() {
-  tft.fillRect(0, 12, 160, 12, ST77XX_BLACK);
+  tft.fillRect(0, 0, 160, 12, ST77XX_BLACK);
   tft.setTextSize(1);
-  tft.setCursor(0, 12);
+  tft.setCursor(0, 0);
   tft.print("Vibe: ");
   tft.print(intensityLabel(intensityMode));
 }
 
 void updatePingRateDisplay() {
-  tft.fillRect(0, 24, 160, 12, ST77XX_BLACK);
+  tft.fillRect(0, 12, 160, 12, ST77XX_BLACK);
   tft.setTextSize(1);
-  tft.setCursor(0, 24);
+  tft.setCursor(0, 12);
   tft.print("Ping: ");
   tft.print(pingBaseMs);
   tft.print("ms");
 }
 
 void updateFeedbackDisplay() {
-  tft.fillRect(0, 36, 160, 12, ST77XX_BLACK);
+  tft.fillRect(0, 24, 160, 12, ST77XX_BLACK);
   tft.setTextSize(1);
-  tft.setCursor(0, 36);
+  tft.setCursor(0, 24);
   tft.print("Mode: ");
-  tft.print(feedbackConstant ? "constant" : "pulse");
+  if (feedbackMode == FEEDBACK_PULSED_RATE) {
+    tft.print("pulsed");
+  } else if (feedbackMode == FEEDBACK_PULSE_ON_RX) {
+    tft.print("rx-pulse");
+  } else {
+    tft.print("constant");
+  }
 }
 
 void updateUiSelectionDisplay() {
-  tft.fillRect(0, 48, 160, 12, ST77XX_BLACK);
+  tft.fillRect(0, 72, 160, 12, ST77XX_BLACK);
   tft.setTextSize(1);
-  tft.setCursor(0, 48);
+  tft.setCursor(0, 72);
   tft.print("Edit: ");
   if (uiSetting == UI_VIBE) tft.print("vibe");
   else if (uiSetting == UI_PING) tft.print("ping");
-  else tft.print("feedback");
+  else if (uiSetting == UI_FEEDBACK) tft.print("feedback");
+  else if (uiSetting == UI_SIM) tft.print("sim");
+  else tft.print("scale");
+}
+
+void updateSimDisplay() {
+  tft.fillRect(0, 48, 160, 12, ST77XX_BLACK);
+  tft.setTextSize(1);
+  tft.setCursor(0, 48);
+  tft.print("Sim: ");
+  tft.print(simulateDistance ? "on" : "off");
+}
+
+void updateScaleDisplay() {
+  tft.fillRect(0, 60, 160, 12, ST77XX_BLACK);
+  tft.setTextSize(1);
+  tft.setCursor(0, 60);
+  tft.print("Scale: ");
+  tft.print(distanceScaleIndex / 10.0f, 1);
+  tft.print("x");
+}
+
+enum DistanceBand : uint8_t {
+  BAND_NONE = 0,
+  BAND_FAR = 1,
+  BAND_MED = 2,
+  BAND_CLOSE = 3
+};
+
+static DistanceBand lastBand = BAND_NONE;
+
+const char* distanceCategoryLabel(DistanceBand band) {
+  switch (band) {
+    case BAND_NONE: return "none";
+    case BAND_FAR: return "far";
+    case BAND_MED: return "medium";
+    default: return "close";
+  }
+}
+
+DistanceBand distanceBandFromStep(int step) {
+  if (step >= 18) return BAND_NONE;
+  if (step >= 13) return BAND_FAR;
+  if (step >= 7) return BAND_MED;
+  return BAND_CLOSE;
+}
+
+void updateDistanceDisplay(int step) {
+  // Add hysteresis by only updating when the band changes
+  DistanceBand band = distanceBandFromStep(step);
+  if (band == lastBand) {
+    return;
+  }
+  lastBand = band;
+  tft.fillRect(0, 36, 160, 12, ST77XX_BLACK);
+  tft.setTextSize(1);
+  tft.setCursor(0, 36);
+  tft.print("Dist: ");
+  tft.print(distanceCategoryLabel(band));
 }
 
 void flashStatusLed() {
@@ -200,6 +315,38 @@ void flashStatusLed() {
   digitalWrite(STATUS_LED_PIN, HIGH);
   ledOn = true;
   ledOffMs = millis() + LED_PULSE_MS;
+}
+
+void updateSimulatedDistance() {
+  uint32_t now = millis();
+  if (now - lastSimUpdateMs < SIM_UPDATE_MS) {
+    return;
+  }
+  lastSimUpdateMs = now;
+  uint32_t t = now % SIM_CYCLE_MS;
+
+  if (t < SIM_PHASE_MS) {
+    // Phase 1: no node nearby
+    lastRxMs = now - (VIBE_TIMEOUT_MS + 1000);
+  } else if (t < SIM_PHASE_MS * 2) {
+    // Phase 2: getting closer (far -> close)
+    uint32_t p = t - SIM_PHASE_MS;
+    float frac = (float)p / (float)SIM_PHASE_MS;
+    int step = (int)round(19.0f * (1.0f - frac));
+    if (step < 0) step = 0;
+    if (step > 19) step = 19;
+    lastStep = applyDistanceScale(step);
+    lastRxMs = now;
+  } else {
+    // Phase 3: getting farther (close -> far)
+    uint32_t p = t - (SIM_PHASE_MS * 2);
+    float frac = (float)p / (float)SIM_PHASE_MS;
+    int step = (int)round(19.0f * frac);
+    if (step < 0) step = 0;
+    if (step > 19) step = 19;
+    lastStep = applyDistanceScale(step);
+    lastRxMs = now;
+  }
 }
 
 String buildPing() {
@@ -314,7 +461,7 @@ void vibrationTask(void* parameter) {
           vibeOn = false;
         }
         nextVibeToggleMs = now + 200;
-      } else if (feedbackConstant) {
+      } else if (feedbackMode == FEEDBACK_PULSED_RATE) {
         // Smooth interval to reduce jitter
         float targetInterval = (float)vibrationIntervalForStep(lastStep);
         smoothedIntervalMs = INTERVAL_SMOOTH_ALPHA * targetInterval
@@ -338,6 +485,11 @@ void vibrationTask(void* parameter) {
             nextVibeToggleMs = now + onMs;
           }
         }
+      } else if (feedbackMode == FEEDBACK_CONSTANT) {
+        // Constant vibration intensity (no pulsing)
+        uint8_t intensity = motorIntensityWithMode(lastStep);
+        drv.setRealtimeValue(intensity);
+        vibeOn = true;
       }
     }
 
@@ -354,14 +506,8 @@ void setup() {
     delay(10);
   }
   
-  // Longer delay for serial monitor connection
-  delay(5000);
-  Serial.println("\nStarting in 3...");
-  delay(1000);
-  Serial.println("2...");
-  delay(1000);
-  Serial.println("1...");
-  delay(1000);
+  // Short delay for serial monitor connection
+  delay(300);
 
   Serial.println("\n\n========================================");
   Serial.println("  Wireless Tracker - TFT + LoRa");
@@ -373,6 +519,9 @@ void setup() {
   deviceId = (uint32_t)(mac ^ (mac >> 32));
   Serial.print("Device ID: ");
   Serial.println(deviceId, HEX);
+
+  prefs.begin("humn", false);
+  loadSettings();
 
   // Enable Vext (powers TFT + GNSS)
   pinMode(VEXT_CTRL, OUTPUT);
@@ -396,18 +545,11 @@ void setup() {
   tft.setRotation(1);
   tft.fillScreen(ST77XX_BLACK);
 
-  // Draw test text
+  // Draw base UI
+  tft.fillScreen(ST77XX_BLACK);
   tft.setTextWrap(false);
   tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
   tft.setTextSize(1);
-  tft.setCursor(0, 0);
-  tft.println("Wireless Tracker");
-  tft.println("TFT OK!");
-  tft.println("LoRa init...");
-
-  tft.setTextSize(2);
-  tft.setCursor(0, 40);
-  tft.print("HELLO");
 
   Serial.println("TFT init complete.");
 
@@ -425,15 +567,9 @@ void setup() {
 
   if (state == RADIOLIB_ERR_NONE) {
     Serial.println("LoRa init OK.");
-    tft.fillRect(0, 24, 160, 12, ST77XX_BLACK);
-    tft.setCursor(0, 24);
-    tft.println("LoRa OK");
   } else {
     Serial.print("LoRa init failed: ");
     Serial.println(state);
-    tft.fillRect(0, 24, 160, 12, ST77XX_BLACK);
-    tft.setCursor(0, 24);
-    tft.println("LoRa FAIL");
   }
 
   lora.setDio1Action(setLoraFlag);
@@ -474,6 +610,9 @@ void setup() {
   updatePingRateDisplay();
   updateFeedbackDisplay();
   updateUiSelectionDisplay();
+  updateSimDisplay();
+  updateScaleDisplay();
+  updateSimDisplay();
 
   if (drvOk && vibeTaskHandle == nullptr) {
     xTaskCreatePinnedToCore(
@@ -489,8 +628,14 @@ void setup() {
 }
 
 void loop() {
+  // Optional distance simulation (disables RF-based distance)
+  if (simulateDistance) {
+    updateSimulatedDistance();
+    updateDistanceDisplay(lastStep);
+  }
+
   // Handle received packets
-  if (loraRxFlag) {
+  if (!simulateDistance && loraRxFlag) {
     loraInterruptEnabled = false;
     loraRxFlag = false;
 
@@ -501,20 +646,21 @@ void loop() {
       lastRssi = (int16_t)lora.getRSSI();
       lastSnr = lora.getSNR();
 
-      Serial.print("RSSI=");
-      Serial.print(lastRssi);
-      Serial.print(" dBm SNR=");
-      Serial.print(lastSnr);
-      Serial.print(" dB");
-
       // Smooth RSSI to reduce jitter
       smoothedRssi = RSSI_SMOOTH_ALPHA * lastRssi + (1.0f - RSSI_SMOOTH_ALPHA) * smoothedRssi;
       int step = estimateDistanceStep((int16_t)round(smoothedRssi));
-      Serial.print(" | Step ");
-      Serial.print(step);
-      Serial.print("/19 (");
-      Serial.print(distanceLabel(step));
-      Serial.println(")");
+      rxCounter++;
+      if (rxCounter % rxLogEvery == 0) {
+        Serial.print("RSSI=");
+        Serial.print(lastRssi);
+        Serial.print(" dBm SNR=");
+        Serial.print(lastSnr);
+        Serial.print(" dB | Step ");
+        Serial.print(step);
+        Serial.print("/19 (");
+        Serial.print(distanceLabel(step));
+        Serial.println(")");
+      }
 
       // Track latest step for vibration rate control
       lastStep = step;
@@ -534,15 +680,23 @@ void loop() {
 
       flashStatusLed();
 
-      // Pulse mode: short haptic on any reception
-      if (!feedbackConstant) {
+      // RX-pulse mode: short haptic on any reception
+      if (feedbackMode == FEEDBACK_PULSE_ON_RX) {
         requestHapticStep = step;
         requestHapticPulse = true;
       }
+
+      updateDistanceDisplay(step);
     }
 
     lora.startReceive();
     loraInterruptEnabled = true;
+  }
+
+  // If simulating, ignore RF updates (clear flag if set)
+  if (simulateDistance && loraRxFlag) {
+    loraRxFlag = false;
+    lora.startReceive();
   }
 
   // Vibration is handled by a dedicated task
@@ -560,13 +714,16 @@ void loop() {
   if (btnPressed && !btnHoldHandled && (millis() - btnPressStartMs > BTN_HOLD_MS)) {
     // Long-press: cycle which setting is being edited
     btnHoldHandled = true;
-    uiSetting = (uiSetting + 1) % 3;
+    uiSetting = (uiSetting + 1) % 5;
 
     Serial.print("Edit setting: ");
     if (uiSetting == UI_VIBE) Serial.println("vibe");
     else if (uiSetting == UI_PING) Serial.println("ping");
-    else Serial.println("feedback");
+    else if (uiSetting == UI_FEEDBACK) Serial.println("feedback");
+    else if (uiSetting == UI_SIM) Serial.println("sim");
+    else Serial.println("scale");
     updateUiSelectionDisplay();
+    saveSettings();
     requestHapticStep = 0;
     requestHapticPulse = true;
   }
@@ -581,6 +738,7 @@ void loop() {
       Serial.print("Intensity mode: ");
       Serial.println(label);
       updateIntensityDisplay();
+      saveSettings();
     } else if (uiSetting == UI_PING) {
       pingRateIndex = (pingRateIndex + 1) % (sizeof(PING_RATES_MS) / sizeof(PING_RATES_MS[0]));
       pingBaseMs = PING_RATES_MS[pingRateIndex];
@@ -589,11 +747,31 @@ void loop() {
       Serial.print(pingBaseMs);
       Serial.println(" ms");
       updatePingRateDisplay();
-    } else {
-      feedbackConstant = !feedbackConstant;
+      saveSettings();
+    } else if (uiSetting == UI_FEEDBACK) {
+      feedbackMode = (FeedbackMode)((feedbackMode + 1) % 3);
       Serial.print("Feedback mode: ");
-      Serial.println(feedbackConstant ? "constant" : "pulse");
+      if (feedbackMode == FEEDBACK_PULSED_RATE) Serial.println("pulsed");
+      else if (feedbackMode == FEEDBACK_PULSE_ON_RX) Serial.println("rx-pulse");
+      else Serial.println("constant");
       updateFeedbackDisplay();
+      saveSettings();
+    } else if (uiSetting == UI_SIM) {
+      simulateDistance = !simulateDistance;
+      Serial.print("Sim mode: ");
+      Serial.println(simulateDistance ? "on" : "off");
+
+      updateSimDisplay();
+      saveSettings();
+    } else {
+      // Distance scale: 0.1x .. 2.0x in 0.1 steps
+      distanceScaleIndex++;
+      if (distanceScaleIndex > 20) distanceScaleIndex = 1;
+      Serial.print("Scale: ");
+      Serial.print(distanceScaleIndex / 10.0f, 1);
+      Serial.println("x");
+      updateScaleDisplay();
+      saveSettings();
     }
 
     // Haptic feedback on mode change
