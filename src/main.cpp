@@ -736,6 +736,8 @@ void setup() {
   tft.fillScreen(ST77XX_BLACK);
 
   // Draw boot logo
+  uiSetting = UI_VIBE;
+  updateUiSelectionDisplay();
   setDisplayOn(true, false);
   showHumnLogo();
   delay(1000);
@@ -905,6 +907,8 @@ void loop() {
       btnPowerHandled = true;
       if (deviceOn) {
         setDisplayOn(true, false);
+        uiSetting = UI_VIBE;
+        updateUiSelectionDisplay();
         showHumnLogo();
         delay(1000);
         refreshDisplay();
