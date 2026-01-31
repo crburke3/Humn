@@ -33,7 +33,7 @@ static const int USER_BTN_PIN = 0;
 static const bool USER_BTN_ACTIVE_LOW = true;
 static const uint32_t BTN_DEBOUNCE_MS = 200;
 static const uint32_t BTN_HOLD_MS = 700;
-static const uint32_t BTN_POWER_HOLD_MS = 6000;
+static const uint32_t BTN_POWER_HOLD_MS = 3500;
 
 enum UiSetting : uint8_t {
   UI_VIBE = 0,
@@ -163,6 +163,10 @@ static const uint32_t SIM_UPDATE_MS = 500;
 static bool displayOn = true;
 static uint32_t lastUserInteractionMs = 0;
 static bool deviceOn = true;
+static const uint16_t HUMN_LOGO_W = 120;
+static const uint16_t HUMN_LOGO_H = 40;
+static uint8_t humnLogoBitmap[HUMN_LOGO_W * HUMN_LOGO_H / 8];
+static bool humnLogoBuilt = false;
 
 
 // Simulation mode: cycles distance without RF (user-toggle)
@@ -317,6 +321,94 @@ void updateDistanceDisplay(int step) {
   tft.print(distanceCategoryLabel(band));
 }
 
+void setBitmapPixel(uint8_t* bitmap, uint16_t w, uint16_t x, uint16_t y) {
+  uint32_t index = x + (uint32_t)y * w;
+  uint32_t byteIndex = index >> 3;
+  uint8_t bit = 7 - (index & 0x7);
+  bitmap[byteIndex] |= (1 << bit);
+}
+
+void buildHumnLogoBitmap() {
+  if (humnLogoBuilt) {
+    return;
+  }
+  memset(humnLogoBitmap, 0, sizeof(humnLogoBitmap));
+
+  const int letterW = 22;
+  const int letterH = 24;
+  const int gap = 6;
+  const int thick = 3;
+  const int startX = (HUMN_LOGO_W - (letterW * 4 + gap * 3)) / 2;
+  const int startY = (HUMN_LOGO_H - letterH) / 2;
+
+  auto plot = [&](int x, int y) {
+    if (x < 0 || y < 0 || x >= (int)HUMN_LOGO_W || y >= (int)HUMN_LOGO_H) return;
+    setBitmapPixel(humnLogoBitmap, HUMN_LOGO_W, (uint16_t)x, (uint16_t)y);
+  };
+
+  auto drawRect = [&](int x, int y, int w, int h) {
+    for (int yy = y; yy < y + h; yy++) {
+      for (int xx = x; xx < x + w; xx++) {
+        plot(xx, yy);
+      }
+    }
+  };
+
+  auto drawH = [&](int x) {
+    drawRect(x, startY, thick, letterH);
+    drawRect(x + letterW - thick, startY, thick, letterH);
+    drawRect(x, startY + letterH / 2 - 1, letterW, thick);
+  };
+
+  auto drawU = [&](int x) {
+    drawRect(x, startY, thick, letterH - thick);
+    drawRect(x + letterW - thick, startY, thick, letterH - thick);
+    drawRect(x, startY + letterH - thick, letterW, thick);
+  };
+
+  auto drawM = [&](int x) {
+    drawRect(x, startY, thick, letterH);
+    drawRect(x + letterW - thick, startY, thick, letterH);
+    for (int y = 0; y < letterH; y++) {
+      int dx = (letterW - 2 * thick - 2) * y / (letterH - 1);
+      for (int t = 0; t < thick; t++) {
+        plot(x + thick + dx + t, startY + y);
+        plot(x + letterW - thick - 1 - dx - t, startY + y);
+      }
+    }
+  };
+
+  auto drawN = [&](int x) {
+    drawRect(x, startY, thick, letterH);
+    drawRect(x + letterW - thick, startY, thick, letterH);
+    for (int y = 0; y < letterH; y++) {
+      int dx = (letterW - thick - 1) * y / (letterH - 1);
+      for (int t = 0; t < thick; t++) {
+        plot(x + t + dx, startY + y);
+      }
+    }
+  };
+
+  int x0 = startX;
+  drawH(x0);
+  x0 += letterW + gap;
+  drawU(x0);
+  x0 += letterW + gap;
+  drawM(x0);
+  x0 += letterW + gap;
+  drawN(x0);
+
+  humnLogoBuilt = true;
+}
+
+void showHumnLogo() {
+  buildHumnLogoBitmap();
+  tft.fillScreen(ST77XX_BLACK);
+  int x = (160 - HUMN_LOGO_W) / 2;
+  int y = (80 - HUMN_LOGO_H) / 2;
+  tft.drawBitmap(x, y, humnLogoBitmap, HUMN_LOGO_W, HUMN_LOGO_H, ST77XX_WHITE);
+}
+
 void showSleepCat() {
   tft.fillScreen(ST77XX_BLACK);
   // Bigger sleeping cat using simple shapes
@@ -373,9 +465,13 @@ void setDisplayOn(bool on) {
     return;
   }
   displayOn = on;
-  digitalWrite(TFT_LED_K, on ? HIGH : LOW);
   if (on) {
+    // Clear display before backlight to avoid stale flash
+    tft.fillScreen(ST77XX_BLACK);
+    digitalWrite(TFT_LED_K, HIGH);
     refreshDisplay();
+  } else {
+    digitalWrite(TFT_LED_K, LOW);
   }
 }
 void flashStatusLed() {
@@ -620,8 +716,8 @@ void setup() {
 
   // Enable TFT backlight (polarity may vary by board)
   pinMode(TFT_LED_K, OUTPUT);
-  digitalWrite(TFT_LED_K, HIGH);
-  displayOn = true;
+  digitalWrite(TFT_LED_K, LOW);
+  displayOn = false;
   lastUserInteractionMs = millis();
   delay(50);
 
@@ -637,7 +733,10 @@ void setup() {
   tft.setRotation(1);
   tft.fillScreen(ST77XX_BLACK);
 
-  // Draw base UI
+  // Draw boot logo
+  setDisplayOn(true);
+  showHumnLogo();
+  delay(1000);
   refreshDisplay();
 
   Serial.println("TFT init complete.");
@@ -804,6 +903,9 @@ void loop() {
       btnPowerHandled = true;
       if (deviceOn) {
         setDisplayOn(true);
+        showHumnLogo();
+        delay(1000);
+        refreshDisplay();
       } else {
         if (!displayOn) {
           setDisplayOn(true);
