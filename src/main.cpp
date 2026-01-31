@@ -18,6 +18,7 @@ static const int TFT_MOSI = 42;  // TFT_SDIN
 // Power control
 static const int VEXT_CTRL = 3;  // Vext Ctrl (powers TFT + GNSS)
 static const int TFT_LED_K = 21; // Backlight cathode control
+static const uint32_t DISPLAY_IDLE_MS = 15000;
 
 // Vext control polarity (some Heltec boards use HIGH to enable)
 static const int VEXT_ACTIVE = HIGH;
@@ -32,6 +33,7 @@ static const int USER_BTN_PIN = 0;
 static const bool USER_BTN_ACTIVE_LOW = true;
 static const uint32_t BTN_DEBOUNCE_MS = 200;
 static const uint32_t BTN_HOLD_MS = 700;
+static const uint32_t BTN_POWER_HOLD_MS = 6000;
 
 enum UiSetting : uint8_t {
   UI_VIBE = 0,
@@ -82,12 +84,14 @@ static uint32_t rxCounter = 0;
 static int16_t lastRssi = 0;
 static float lastSnr = 0.0f;
 static uint32_t motorStopMs = 0;
+static uint32_t hapticPreviewUntilMs = 0;
 static bool drvOk = false;
 static uint8_t intensityMode = 1; // 0=soft,1=medium,2=hard,3=max
 static uint32_t lastBtnMs = 0;
 static bool lastBtnState = false;
 static uint32_t btnPressStartMs = 0;
 static bool btnHoldHandled = false;
+static bool btnPowerHandled = false;
 static uint32_t ledOffMs = 0;
 static bool ledOn = false;
 static uint8_t uiSetting = UI_VIBE;
@@ -97,6 +101,7 @@ static TaskHandle_t vibeTaskHandle = nullptr;
 static volatile bool requestHapticPulse = false;
 static volatile int requestHapticStep = 0;
 static uint32_t lastRxMs = 0;
+static uint32_t lastSignalMs = 0;
 static const uint32_t PING_RATES_MS[] = {1000, 800, 600, 400, 300, 200, 100, 50};
 static uint8_t pingRateIndex = 0;
 static uint32_t pingBaseMs = 100;
@@ -104,7 +109,7 @@ static uint32_t pingJitterMs = 100;
 static const uint32_t PING_LATE_WARN_MS = 50;
 
 static const uint32_t TX_WARN_MS = 80;
-static const uint32_t PEER_TIMEOUT_MS = 5000;
+static const uint32_t PEER_TIMEOUT_MS = 3000;
 
 enum Role : uint8_t { ROLE_SEARCH = 0, ROLE_PINGER = 1, ROLE_RESPONDER = 2 };
 static Role role = ROLE_SEARCH;
@@ -131,8 +136,8 @@ void loadSettings() {
   uiSetting = prefs.getUChar("ui", (uint8_t)UI_VIBE);
   simulateDistance = prefs.getBool("sim", false);
   distanceScaleIndex = prefs.getUChar("scale", 10);
-  if (distanceScaleIndex < 1) distanceScaleIndex = 1;
-  if (distanceScaleIndex > 20) distanceScaleIndex = 20;
+  if (distanceScaleIndex < 10) distanceScaleIndex = 10;
+  if (distanceScaleIndex > 30) distanceScaleIndex = 30;
 
   if (pingRateIndex >= (sizeof(PING_RATES_MS) / sizeof(PING_RATES_MS[0]))) {
     pingRateIndex = 0;
@@ -140,7 +145,7 @@ void loadSettings() {
   pingBaseMs = PING_RATES_MS[pingRateIndex];
   pingJitterMs = max<uint32_t>(10, pingBaseMs / 4);
 }
-static const uint32_t VIBE_TIMEOUT_MS = 5000;
+static const uint32_t VIBE_TIMEOUT_MS = 3000;
 static uint32_t nextVibeToggleMs = 0;
 static int lastStep = 19;
 static float smoothedRssi = -100.0f;
@@ -155,6 +160,10 @@ static const uint32_t RX_WATCHDOG_MS = 3000;
 static int lastDisplayStep = -1;
 static uint32_t lastSimUpdateMs = 0;
 static const uint32_t SIM_UPDATE_MS = 500;
+static bool displayOn = true;
+static uint32_t lastUserInteractionMs = 0;
+static bool deviceOn = true;
+
 
 // Simulation mode: cycles distance without RF (user-toggle)
 static const uint32_t SIM_PHASE_MS = 10000;
@@ -308,6 +317,67 @@ void updateDistanceDisplay(int step) {
   tft.print(distanceCategoryLabel(band));
 }
 
+void showSleepCat() {
+  tft.fillScreen(ST77XX_BLACK);
+  // Bigger sleeping cat using simple shapes
+  const int cx = 60;
+  const int cy = 44;
+  const int headR = 14;
+
+  // Body
+  tft.fillRoundRect(cx - 18, cy + 6, 60, 22, 10, ST77XX_WHITE);
+  tft.fillCircle(cx + 40, cy + 16, 10, ST77XX_WHITE);
+
+  // Head
+  tft.fillCircle(cx, cy, headR, ST77XX_WHITE);
+  tft.fillTriangle(cx - 12, cy - 8, cx - 2, cy - 22, cx - 2, cy - 6, ST77XX_WHITE);
+  tft.fillTriangle(cx + 12, cy - 8, cx + 2, cy - 22, cx + 2, cy - 6, ST77XX_WHITE);
+
+  // Face details (eyes closed + mouth)
+  tft.drawLine(cx - 6, cy - 2, cx - 1, cy - 2, ST77XX_BLACK);
+  tft.drawLine(cx + 1, cy - 2, cx + 6, cy - 2, ST77XX_BLACK);
+  tft.drawLine(cx - 1, cy + 2, cx + 1, cy + 2, ST77XX_BLACK);
+
+  // Tail curl
+  tft.drawCircle(cx + 50, cy + 18, 10, ST77XX_BLACK);
+  tft.drawCircle(cx + 50, cy + 18, 8, ST77XX_BLACK);
+
+  // "Zz"
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+  tft.setCursor(10, 8);
+  tft.print("Z");
+  tft.setCursor(20, 4);
+  tft.print("z");
+}
+
+void refreshDisplay() {
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setTextWrap(false);
+  tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+  tft.setTextSize(1);
+
+  updateIntensityDisplay();
+  updatePingRateDisplay();
+  updateFeedbackDisplay();
+  updateUiSelectionDisplay();
+  updateSimDisplay();
+  updateScaleDisplay();
+
+  lastBand = (DistanceBand)255;
+  updateDistanceDisplay(lastStep);
+}
+
+void setDisplayOn(bool on) {
+  if (displayOn == on) {
+    return;
+  }
+  displayOn = on;
+  digitalWrite(TFT_LED_K, on ? HIGH : LOW);
+  if (on) {
+    refreshDisplay();
+  }
+}
 void flashStatusLed() {
   if (!LED_ENABLED) {
     return;
@@ -327,7 +397,7 @@ void updateSimulatedDistance() {
 
   if (t < SIM_PHASE_MS) {
     // Phase 1: no node nearby
-    lastRxMs = now - (VIBE_TIMEOUT_MS + 1000);
+    lastSignalMs = now - (VIBE_TIMEOUT_MS + 1000);
   } else if (t < SIM_PHASE_MS * 2) {
     // Phase 2: getting closer (far -> close)
     uint32_t p = t - SIM_PHASE_MS;
@@ -336,7 +406,7 @@ void updateSimulatedDistance() {
     if (step < 0) step = 0;
     if (step > 19) step = 19;
     lastStep = applyDistanceScale(step);
-    lastRxMs = now;
+    lastSignalMs = now;
   } else {
     // Phase 3: getting farther (close -> far)
     uint32_t p = t - (SIM_PHASE_MS * 2);
@@ -345,7 +415,7 @@ void updateSimulatedDistance() {
     if (step < 0) step = 0;
     if (step > 19) step = 19;
     lastStep = applyDistanceScale(step);
-    lastRxMs = now;
+    lastSignalMs = now;
   }
 }
 
@@ -441,10 +511,21 @@ void vibrationTask(void* parameter) {
     if (drvOk) {
       uint32_t now = millis();
 
+      if (!deviceOn) {
+        if (motorStopMs != 0 || vibeOn) {
+          drv.setRealtimeValue(0);
+          motorStopMs = 0;
+          vibeOn = false;
+        }
+        vTaskDelay(delayTicks);
+        continue;
+      }
+
       // Handle short haptic pulse requests (e.g. button feedback)
       if (requestHapticPulse) {
         requestHapticPulse = false;
         motorPulseForStep(requestHapticStep);
+        hapticPreviewUntilMs = now + MOTOR_PULSE_MS + 20;
       }
 
       // Stop motor after pulse duration
@@ -453,8 +534,17 @@ void vibrationTask(void* parameter) {
         motorStopMs = 0;
       }
 
+      // During preview pulse, skip other vibration modes
+      if (hapticPreviewUntilMs != 0) {
+        if (now < hapticPreviewUntilMs) {
+          vTaskDelay(delayTicks);
+          continue;
+        }
+        hapticPreviewUntilMs = 0;
+      }
+
       // Vibration rate control: only vibrate if we received recently
-      if (now - lastRxMs > VIBE_TIMEOUT_MS) {
+      if (now - lastSignalMs > VIBE_TIMEOUT_MS) {
         if (motorStopMs != 0 || vibeOn) {
           drv.setRealtimeValue(0);
           motorStopMs = 0;
@@ -531,6 +621,8 @@ void setup() {
   // Enable TFT backlight (polarity may vary by board)
   pinMode(TFT_LED_K, OUTPUT);
   digitalWrite(TFT_LED_K, HIGH);
+  displayOn = true;
+  lastUserInteractionMs = millis();
   delay(50);
 
   // Setup user button
@@ -546,10 +638,7 @@ void setup() {
   tft.fillScreen(ST77XX_BLACK);
 
   // Draw base UI
-  tft.fillScreen(ST77XX_BLACK);
-  tft.setTextWrap(false);
-  tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
-  tft.setTextSize(1);
+  refreshDisplay();
 
   Serial.println("TFT init complete.");
 
@@ -590,28 +679,21 @@ void setup() {
     Serial.println(I2C_SCL);
     Serial.println("Button cycles intensity: soft/medium/hard/max");
 
-    // Startup vibration sweep (soft -> max)
-    for (uint8_t i = 0; i < 4; i++) {
-      intensityMode = i;
-      updateIntensityDisplay();
-      drv.setRealtimeValue(motorIntensityForStep(0));
-      delay(150);
-      drv.setRealtimeValue(0);
-      delay(100);
+    // Startup vibration sweep (low -> high) ~0.5s total
+    const uint32_t sweepMs = 500;
+    const uint8_t steps = 20;
+    for (uint8_t i = 0; i < steps; i++) {
+      float t = (steps <= 1) ? 1.0f : (float)i / (float)(steps - 1);
+      uint8_t intensity = (uint8_t)round(20.0f + t * (127.0f - 20.0f));
+      drv.setRealtimeValue(intensity);
+      delay(sweepMs / steps);
     }
-    intensityMode = 0;
-    updateIntensityDisplay();
+    drv.setRealtimeValue(0);
   } else {
     Serial.println("DRV2605L init FAILED.");
     Serial.println("Check wiring + power. DRV2605L addr is 0x5A or 0x5B.");
   }
 
-  updateIntensityDisplay();
-  updatePingRateDisplay();
-  updateFeedbackDisplay();
-  updateUiSelectionDisplay();
-  updateSimDisplay();
-  updateScaleDisplay();
   updateSimDisplay();
 
   if (drvOk && vibeTaskHandle == nullptr) {
@@ -643,6 +725,7 @@ void loop() {
     int state = lora.readData(payload);
     if (state == RADIOLIB_ERR_NONE) {
       lastRxMs = millis();
+      lastSignalMs = lastRxMs;
       lastRssi = (int16_t)lora.getRSSI();
       lastSnr = lora.getSNR();
 
@@ -704,84 +787,121 @@ void loop() {
   // Handle user button
   bool btnPressed = digitalRead(USER_BTN_PIN) == (USER_BTN_ACTIVE_LOW ? LOW : HIGH);
 
-  if (btnPressed && !lastBtnState && (millis() - lastBtnMs > BTN_DEBOUNCE_MS)) {
-    // Button pressed
-    lastBtnMs = millis();
-    btnPressStartMs = millis();
+  uint32_t nowMs = millis();
+  bool pressedEdge = btnPressed && !lastBtnState && (nowMs - lastBtnMs > BTN_DEBOUNCE_MS);
+  if (pressedEdge) {
+    lastBtnMs = nowMs;
+    btnPressStartMs = nowMs;
     btnHoldHandled = false;
+    btnPowerHandled = false;
   }
 
-  if (btnPressed && !btnHoldHandled && (millis() - btnPressStartMs > BTN_HOLD_MS)) {
-    // Long-press: cycle which setting is being edited
-    btnHoldHandled = true;
-    uiSetting = (uiSetting + 1) % 5;
+  if (btnPressed && btnPressStartMs != 0) {
+    uint32_t heldMs = nowMs - btnPressStartMs;
 
-    Serial.print("Edit setting: ");
-    if (uiSetting == UI_VIBE) Serial.println("vibe");
-    else if (uiSetting == UI_PING) Serial.println("ping");
-    else if (uiSetting == UI_FEEDBACK) Serial.println("feedback");
-    else if (uiSetting == UI_SIM) Serial.println("sim");
-    else Serial.println("scale");
-    updateUiSelectionDisplay();
-    saveSettings();
-    requestHapticStep = 0;
-    requestHapticPulse = true;
-  }
+    if (heldMs >= BTN_POWER_HOLD_MS && !btnPowerHandled) {
+      deviceOn = !deviceOn;
+      btnPowerHandled = true;
+      if (deviceOn) {
+        setDisplayOn(true);
+      } else {
+        if (!displayOn) {
+          setDisplayOn(true);
+        }
+        showSleepCat();
+        delay(1000);
+        setDisplayOn(false);
+      }
+      lastUserInteractionMs = nowMs;
+      if (!deviceOn && drvOk) {
+        drv.setRealtimeValue(0);
+        motorStopMs = 0;
+        vibeOn = false;
+      }
+      // Power action triggers immediately; ignore release for this hold.
+      btnPressStartMs = 0;
+    } else if (deviceOn && displayOn && heldMs >= BTN_HOLD_MS && !btnHoldHandled) {
+      // Long-press: cycle which setting is being edited
+      btnHoldHandled = true;
+      uiSetting = (uiSetting + 1) % 5;
 
-  if (!btnPressed && lastBtnState && !btnHoldHandled) {
-    // Short press: adjust the active setting
-    if (uiSetting == UI_VIBE) {
-      intensityMode = (intensityMode + 1) % 4;
-      const char* label = (intensityMode == 0) ? "soft" :
-                          (intensityMode == 1) ? "medium" :
-                          (intensityMode == 2) ? "hard" : "max";
-      Serial.print("Intensity mode: ");
-      Serial.println(label);
-      updateIntensityDisplay();
+      Serial.print("Edit setting: ");
+      if (uiSetting == UI_VIBE) Serial.println("vibe");
+      else if (uiSetting == UI_PING) Serial.println("ping");
+      else if (uiSetting == UI_FEEDBACK) Serial.println("feedback");
+      else if (uiSetting == UI_SIM) Serial.println("sim");
+      else Serial.println("scale");
+      updateUiSelectionDisplay();
       saveSettings();
-    } else if (uiSetting == UI_PING) {
-      pingRateIndex = (pingRateIndex + 1) % (sizeof(PING_RATES_MS) / sizeof(PING_RATES_MS[0]));
-      pingBaseMs = PING_RATES_MS[pingRateIndex];
-      pingJitterMs = max<uint32_t>(10, pingBaseMs / 4);
-      Serial.print("Ping rate: ");
-      Serial.print(pingBaseMs);
-      Serial.println(" ms");
-      updatePingRateDisplay();
-      saveSettings();
-    } else if (uiSetting == UI_FEEDBACK) {
-      feedbackMode = (FeedbackMode)((feedbackMode + 1) % 3);
-      Serial.print("Feedback mode: ");
-      if (feedbackMode == FEEDBACK_PULSED_RATE) Serial.println("pulsed");
-      else if (feedbackMode == FEEDBACK_PULSE_ON_RX) Serial.println("rx-pulse");
-      else Serial.println("constant");
-      updateFeedbackDisplay();
-      saveSettings();
-    } else if (uiSetting == UI_SIM) {
-      simulateDistance = !simulateDistance;
-      Serial.print("Sim mode: ");
-      Serial.println(simulateDistance ? "on" : "off");
-
-      updateSimDisplay();
-      saveSettings();
-    } else {
-      // Distance scale: 0.1x .. 2.0x in 0.1 steps
-      distanceScaleIndex++;
-      if (distanceScaleIndex > 20) distanceScaleIndex = 1;
-      Serial.print("Scale: ");
-      Serial.print(distanceScaleIndex / 10.0f, 1);
-      Serial.println("x");
-      updateScaleDisplay();
-      saveSettings();
+      requestHapticStep = 0;
+      requestHapticPulse = true;
+      lastUserInteractionMs = nowMs;
     }
-
-    // Haptic feedback on mode change
-    requestHapticStep = 0;
-    requestHapticPulse = true;
   }
 
-  if (!btnPressed) {
+  bool releasedEdge = !btnPressed && lastBtnState;
+  if (releasedEdge && btnPressStartMs != 0) {
+    uint32_t heldMs = nowMs - btnPressStartMs;
     btnPressStartMs = 0;
+
+    if (!deviceOn) {
+      // Ignore on release if device is off
+    } else if (!displayOn) {
+      setDisplayOn(true);
+      lastUserInteractionMs = nowMs;
+    } else if (heldMs < BTN_HOLD_MS && !btnPowerHandled) {
+      // Short press: adjust the active setting
+      if (uiSetting == UI_VIBE) {
+        intensityMode = (intensityMode + 1) % 4;
+        const char* label = (intensityMode == 0) ? "soft" :
+                            (intensityMode == 1) ? "medium" :
+                            (intensityMode == 2) ? "hard" : "max";
+        Serial.print("Intensity mode: ");
+        Serial.println(label);
+        updateIntensityDisplay();
+        saveSettings();
+      } else if (uiSetting == UI_PING) {
+        pingRateIndex = (pingRateIndex + 1) % (sizeof(PING_RATES_MS) / sizeof(PING_RATES_MS[0]));
+        pingBaseMs = PING_RATES_MS[pingRateIndex];
+        pingJitterMs = max<uint32_t>(10, pingBaseMs / 4);
+        Serial.print("Ping rate: ");
+        Serial.print(pingBaseMs);
+        Serial.println(" ms");
+        updatePingRateDisplay();
+        saveSettings();
+      } else if (uiSetting == UI_FEEDBACK) {
+        feedbackMode = (FeedbackMode)((feedbackMode + 1) % 3);
+        Serial.print("Feedback mode: ");
+        if (feedbackMode == FEEDBACK_PULSED_RATE) Serial.println("pulsed");
+        else if (feedbackMode == FEEDBACK_PULSE_ON_RX) Serial.println("rx-pulse");
+        else Serial.println("constant");
+        updateFeedbackDisplay();
+        saveSettings();
+      } else if (uiSetting == UI_SIM) {
+        simulateDistance = !simulateDistance;
+        Serial.print("Sim mode: ");
+        Serial.println(simulateDistance ? "on" : "off");
+
+        updateSimDisplay();
+        saveSettings();
+      } else {
+        // Distance scale: 1.0x .. 3.0x in 0.1 steps
+        distanceScaleIndex++;
+        if (distanceScaleIndex > 30) distanceScaleIndex = 10;
+        Serial.print("Scale: ");
+        Serial.print(distanceScaleIndex / 10.0f, 1);
+        Serial.println("x");
+        updateScaleDisplay();
+        saveSettings();
+      }
+
+      // Haptic feedback on mode change
+      requestHapticStep = 0;
+      requestHapticPulse = true;
+      lastUserInteractionMs = nowMs;
+    }
   }
+
   lastBtnState = btnPressed;
 
   // Send ping with jitter to reduce collisions
@@ -796,16 +916,20 @@ void loop() {
     nextPingMs = now + pingBaseMs + random(0, pingJitterMs);
   }
 
-  // Role timeout: return to search if peer disappears
-  if (role != ROLE_SEARCH && (now - lastPeerSeenMs > PEER_TIMEOUT_MS)) {
-    role = ROLE_SEARCH;
-    peerId = 0;
-    Serial.println("Role: SEARCH");
+  // Signal timeout: return to search + clear distance display
+  if (!simulateDistance && (now - lastSignalMs > PEER_TIMEOUT_MS)) {
+    if (role != ROLE_SEARCH) {
+      role = ROLE_SEARCH;
+      peerId = 0;
+      Serial.println("Role: SEARCH");
+    }
+    lastStep = 19;
+    updateDistanceDisplay(lastStep);
   }
 
   if (now >= nextPingMs) {
     // In SEARCH mode, avoid pinging right after RX to reduce collisions
-    if (role == ROLE_SEARCH && now - lastRxMs < 400) {
+    if (role == ROLE_SEARCH && now - lastSignalMs < 400) {
       nextPingMs = now + pingBaseMs + random(0, pingJitterMs);
     } else if (role == ROLE_SEARCH || role == ROLE_PINGER) {
       pingCounter++;
@@ -841,6 +965,11 @@ void loop() {
   if (millis() - lastRxMs > RX_WATCHDOG_MS) {
     lora.startReceive();
     lastRxMs = millis();
+  }
+
+  // Display idle timeout
+  if (displayOn && (millis() - lastUserInteractionMs > DISPLAY_IDLE_MS)) {
+    setDisplayOn(false);
   }
 
   // LED pulse off
