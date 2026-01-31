@@ -33,7 +33,7 @@ static const int USER_BTN_PIN = 0;
 static const bool USER_BTN_ACTIVE_LOW = true;
 static const uint32_t BTN_DEBOUNCE_MS = 200;
 static const uint32_t BTN_HOLD_MS = 700;
-static const uint32_t BTN_POWER_HOLD_MS = 3500;
+static const uint32_t BTN_POWER_HOLD_MS = 3000;
 
 enum UiSetting : uint8_t {
   UI_VIBE = 0,
@@ -460,7 +460,7 @@ void refreshDisplay() {
   updateDistanceDisplay(lastStep);
 }
 
-void setDisplayOn(bool on) {
+void setDisplayOn(bool on, bool refresh = true) {
   if (displayOn == on) {
     return;
   }
@@ -469,7 +469,9 @@ void setDisplayOn(bool on) {
     // Clear display before backlight to avoid stale flash
     tft.fillScreen(ST77XX_BLACK);
     digitalWrite(TFT_LED_K, HIGH);
-    refreshDisplay();
+    if (refresh) {
+      refreshDisplay();
+    }
   } else {
     digitalWrite(TFT_LED_K, LOW);
   }
@@ -734,7 +736,7 @@ void setup() {
   tft.fillScreen(ST77XX_BLACK);
 
   // Draw boot logo
-  setDisplayOn(true);
+  setDisplayOn(true, false);
   showHumnLogo();
   delay(1000);
   refreshDisplay();
@@ -902,7 +904,7 @@ void loop() {
       deviceOn = !deviceOn;
       btnPowerHandled = true;
       if (deviceOn) {
-        setDisplayOn(true);
+        setDisplayOn(true, false);
         showHumnLogo();
         delay(1000);
         refreshDisplay();
