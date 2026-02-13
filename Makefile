@@ -17,6 +17,7 @@ upload-all:
 kill-monitors:
 	-pkill -f "pio device monitor --port $(PORT1)" || true
 	-pkill -f "pio device monitor --port $(PORT2)" || true
+	-pkill -f "pio device monitor --port /dev/.*usbmodem" || true
 
 monitor1:
 	osascript -e 'tell application "Terminal" to do script "cd \"$(CURDIR)\" && pio device monitor --port $(PORT1) --baud 115200"'
@@ -25,8 +26,14 @@ monitor2:
 	osascript -e 'tell application "Terminal" to do script "cd \"$(CURDIR)\" && pio device monitor --port $(PORT2) --baud 115200"'
 
 monitor-all: kill-monitors
-	osascript -e 'tell application "Terminal" to do script "cd \"$(CURDIR)\" && pio device monitor --port $(PORT1) --baud 115200"'
-	osascript -e 'tell application "Terminal" to do script "cd \"$(CURDIR)\" && pio device monitor --port $(PORT2) --baud 115200"'
+	@ports=$$(ls /dev/tty.usbmodem* /dev/cu.usbmodem* 2>/dev/null || true); \
+	if [ -z "$$ports" ]; then \
+		echo "No usbmodem serial ports found (looked for /dev/*usbmodem*)."; \
+		exit 1; \
+	fi; \
+	for p in $$ports; do \
+		osascript -e "tell application \"Terminal\" to do script \"cd \\\"$(CURDIR)\\\" && pio device monitor --port $$p --baud 115200\""; \
+	done
 
 upload-monitor1: upload1
 	osascript -e 'tell application "Terminal" to do script "cd \"$(CURDIR)\" && pio device monitor --port $(PORT1) --baud 115200"'

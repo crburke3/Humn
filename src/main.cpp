@@ -6,6 +6,10 @@
 #include <RadioLib.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7735.h>
+#include <esp_sleep.h>
+#include <esp_system.h>
+#include <esp_log.h>
+#include <WiFi.h>
 
 // Heltec Wireless Tracker V1.1 TFT pins (from datasheet)
 // TFT: ST7735 160x80, SPI interface
@@ -27,6 +31,7 @@ static const int VEXT_ACTIVE = HIGH;
 static const int I2C_SDA = 4;
 static const int I2C_SCL = 5;
 static const uint16_t MOTOR_PULSE_MS = 200;
+static const int GNSS_RST_PIN = 35; // GPIO35 = GNSS_RST
 
 // User button (GPIO0) cycles vibration intensity
 static const int USER_BTN_PIN = 0;
@@ -34,6 +39,9 @@ static const bool USER_BTN_ACTIVE_LOW = true;
 static const uint32_t BTN_DEBOUNCE_MS = 200;
 static const uint32_t BTN_HOLD_MS = 700;
 static const uint32_t BTN_POWER_HOLD_MS = 3000;
+static const int ADC_BAT_PIN = 1;   // GPIO1 = Vbat_Read
+static const int ADC_CTRL_PIN = 2;  // GPIO2 = ADC_Ctrl
+static const float VBAT_DIVIDER = 4.9f;
 
 enum UiSetting : uint8_t {
   UI_VIBE = 0,
@@ -42,6 +50,9 @@ enum UiSetting : uint8_t {
   UI_SIM = 3,
   UI_SCALE = 4
 };
+
+void updateBatteryDisplay(bool force = false);
+void setDisplayOn(bool on, bool refresh = true);
 
 // Status LED
 static const int STATUS_LED_PIN = 18;
@@ -69,11 +80,18 @@ static const uint8_t LORA_CR = 5;
 static const uint8_t LORA_SYNC_WORD = 0x12;
 static const int8_t LORA_TX_POWER = 22;
 
+// Power saving with CAD (Channel Activity Detection)
+static const uint32_t CAD_CHECK_INTERVAL_MS = 100;  // How often to check for signals in light sleep
+static const uint32_t IDLE_LIGHT_SLEEP_MS = 30000;  // Enter light sleep after this idle time
+static const uint32_t IDLE_DEEP_SLEEP_MS = 300000;  // Enter deep sleep after 5 min idle
+static bool powerSaveMode = true;  // Enable CAD-based power saving
+
 SPIClass spiLoRa(FSPI);
 SX1262 lora = new Module(LORA_NSS, LORA_DIO1, LORA_RST, LORA_BUSY, spiLoRa);
 
 volatile bool loraRxFlag = false;
 volatile bool loraInterruptEnabled = true;
+volatile bool cadDetectedFlag = false;
 
 static uint32_t nextPingMs = 0;
 static uint32_t pingCounter = 0;
@@ -107,6 +125,13 @@ static uint8_t pingRateIndex = 0;
 static uint32_t pingBaseMs = 100;
 static uint32_t pingJitterMs = 100;
 static const uint32_t PING_LATE_WARN_MS = 50;
+static uint32_t lastPingLateLogMs = 0;
+static const uint32_t PING_LATE_LOG_THROTTLE_MS = 2000;
+static const uint32_t SEARCH_SLEEP_PING_MS = 2000;
+// Serial logging can trip the INT_WDT on ESP32-S3 with USB CDC under load.
+// Keep these off unless actively debugging.
+static bool verboseTimingLogs = false;
+static bool verboseUiLogs = false;
 
 static const uint32_t TX_WARN_MS = 80;
 static const uint32_t PEER_TIMEOUT_MS = 3000;
@@ -161,8 +186,18 @@ static int lastDisplayStep = -1;
 static uint32_t lastSimUpdateMs = 0;
 static const uint32_t SIM_UPDATE_MS = 500;
 static bool displayOn = true;
+// Light sleep mode = display turned off by the idle timeout (not by other causes).
+// In this mode we may enter ESP32 light sleep with LoRa CAD, and waking should NOT
+// show the boot logo or boot vibration (because we didn't reboot).
+static bool lightSleepMode = false;
 static uint32_t lastUserInteractionMs = 0;
 static bool deviceOn = true;
+static uint32_t lastBatteryReadMs = 0;
+static int lastBatteryPct = -1;
+
+void enterDeepSleep();
+void playBootVibration();
+void requireWakeHoldIfNeeded();
 static const uint16_t HUMN_LOGO_W = 120;
 static const uint16_t HUMN_LOGO_H = 40;
 static uint8_t humnLogoBitmap[HUMN_LOGO_W * HUMN_LOGO_H / 8];
@@ -173,11 +208,36 @@ static bool humnLogoBuilt = false;
 static const uint32_t SIM_PHASE_MS = 10000;
 static const uint32_t SIM_CYCLE_MS = SIM_PHASE_MS * 3;
 
-void setLoraFlag() {
+void IRAM_ATTR setLoraFlag() {
   if (!loraInterruptEnabled) {
     return;
   }
   loraRxFlag = true;
+}
+
+void IRAM_ATTR setCADFlag() {
+  cadDetectedFlag = true;
+}
+
+static void printBootReason() {
+  esp_reset_reason_t rr = esp_reset_reason();
+  Serial.print("Reset reason: ");
+  switch (rr) {
+    case ESP_RST_POWERON: Serial.println("POWERON"); break;
+    case ESP_RST_EXT: Serial.println("EXT"); break;
+    case ESP_RST_SW: Serial.println("SW"); break;
+    case ESP_RST_PANIC: Serial.println("PANIC"); break;
+    case ESP_RST_INT_WDT: Serial.println("INT_WDT"); break;
+    case ESP_RST_TASK_WDT: Serial.println("TASK_WDT"); break;
+    case ESP_RST_WDT: Serial.println("WDT"); break;
+    case ESP_RST_BROWNOUT: Serial.println("BROWNOUT"); break;
+    case ESP_RST_SDIO: Serial.println("SDIO"); break;
+    default: Serial.println((int)rr); break;
+  }
+
+  esp_sleep_wakeup_cause_t wc = esp_sleep_get_wakeup_cause();
+  Serial.print("Wakeup cause: ");
+  Serial.println((int)wc);
 }
 
 int applyDistanceScale(int step) {
@@ -228,6 +288,7 @@ void updateIntensityDisplay() {
   tft.setCursor(0, 0);
   tft.print("Vibe: ");
   tft.print(intensityLabel(intensityMode));
+  updateBatteryDisplay(true);
 }
 
 void updatePingRateDisplay() {
@@ -319,6 +380,56 @@ void updateDistanceDisplay(int step) {
   tft.setCursor(0, 36);
   tft.print("Dist: ");
   tft.print(distanceCategoryLabel(band));
+}
+
+float readBatteryVoltage() {
+  digitalWrite(ADC_CTRL_PIN, HIGH);
+  delay(2);
+  int mv = analogReadMilliVolts(ADC_BAT_PIN);
+  digitalWrite(ADC_CTRL_PIN, LOW);
+  if (mv <= 0) {
+    return 0.0f;
+  }
+  return (mv / 1000.0f) * VBAT_DIVIDER;
+}
+
+int batteryPercentFromVoltage(float vbat) {
+  const float vMin = 3.3f;
+  const float vMax = 4.2f;
+  if (vbat <= vMin) return 0;
+  if (vbat >= vMax) return 100;
+  float pct = (vbat - vMin) / (vMax - vMin) * 100.0f;
+  return (int)round(pct);
+}
+
+void updateBatteryDisplay(bool force) {
+  if (!displayOn) {
+    return;
+  }
+  float vbat = readBatteryVoltage();
+  if (vbat <= 0.1f) {
+    return;
+  }
+  int pct = batteryPercentFromVoltage(vbat);
+  if (!force && pct == lastBatteryPct) {
+    return;
+  }
+  lastBatteryPct = pct;
+
+  char buf[6];
+  snprintf(buf, sizeof(buf), "%d%%", pct);
+  int len = (int)strlen(buf);
+  int textWidth = len * 6; // 6px per char at text size 1
+  int clearX = 160 - 40;
+  int x = 160 - textWidth;
+  if (x < clearX) {
+    x = clearX;
+  }
+
+  tft.fillRect(clearX, 0, 40, 12, ST77XX_BLACK);
+  tft.setTextSize(1);
+  tft.setCursor(x, 0);
+  tft.print(buf);
 }
 
 void setBitmapPixel(uint8_t* bitmap, uint16_t w, uint16_t x, uint16_t y) {
@@ -443,6 +554,169 @@ void showSleepCat() {
   tft.print("z");
 }
 
+void playBootVibration() {
+  if (!drvOk) {
+    return;
+  }
+  const uint32_t sweepMs = 500;
+  const uint8_t steps = 20;
+  for (uint8_t i = 0; i < steps; i++) {
+    float t = (steps <= 1) ? 1.0f : (float)i / (float)(steps - 1);
+    uint8_t intensity = (uint8_t)round(20.0f + t * (127.0f - 20.0f));
+    drv.setRealtimeValue(intensity);
+    delay(sweepMs / steps);
+  }
+  drv.setRealtimeValue(0);
+}
+
+void enterDeepSleep() {
+  playBootVibration();
+  requestHapticPulse = false;
+  hapticPreviewUntilMs = 0;
+  motorStopMs = 0;
+  vibeOn = false;
+  if (drvOk) {
+    drv.setRealtimeValue(0);
+    delay(20);
+    drv.setRealtimeValue(0);
+  }
+  showSleepCat();
+  delay(1000);
+  // Deep sleep is not light sleep mode (display timeout); clear the flag.
+  lightSleepMode = false;
+  setDisplayOn(false);
+  digitalWrite(VEXT_CTRL, !VEXT_ACTIVE);
+  loraInterruptEnabled = false;
+  lora.sleep();
+  // Best-effort radio shutdown for maximum power savings.
+  // (WiFi/BLE are not used in normal operation, but explicitly disable anyway.)
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_OFF);
+  btStop();
+
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)USER_BTN_PIN, USER_BTN_ACTIVE_LOW ? 0 : 1);
+  esp_deep_sleep_start();
+}
+
+// Enter light sleep with CAD monitoring for power savings
+void enterLightSleepWithCAD(uint32_t durationMs) {
+  if (!powerSaveMode) {
+    delay(durationMs);
+    return;
+  }
+  // Only allow CAD during light sleep mode (display-off due to timeout).
+  if (!lightSleepMode) {
+    delay(durationMs);
+    return;
+  }
+  // Development safety: entering light sleep while USB CDC serial is connected
+  // can trip the interrupt watchdog on ESP32-S3 (seen as INT_WDT in logs).
+  // Skip light sleep when a serial monitor is attached; still allows CAD sleep
+  // in untethered/battery use.
+  if (Serial) {
+    delay(durationMs);
+    return;
+  }
+  
+  // Prepare for light sleep
+  loraInterruptEnabled = false;
+  cadDetectedFlag = false;
+  
+  // Configure LoRa for CAD mode (low power signal detection)
+  // Set up interrupt handler for CAD detection
+  lora.setDio1Action(setCADFlag);
+  
+  // Start interrupt-driven channel scan
+  // This will trigger DIO1 when LoRa preamble is detected
+  int state = lora.startChannelScan();
+  if (state != RADIOLIB_ERR_NONE) {
+    // Avoid heavy serial logging right before light sleep; it can trip WDT on some setups.
+    if (displayOn) {
+      Serial.print("CAD start failed: ");
+      Serial.println(state);
+    }
+    lora.setDio1Action(setLoraFlag);
+    lora.startReceive();
+    loraInterruptEnabled = true;
+    delay(durationMs);
+    return;
+  }
+  
+  // Configure ESP32 wake sources.
+  // Note: ESP32-S3 GPIO wake from light sleep is LEVEL-only (no edges).
+  //
+  // Guard against "stuck asserted" lines (which would cause immediate wake loops):
+  // if DIO1 or the button is already active, don't enter light sleep.
+  if (digitalRead(LORA_DIO1) == HIGH ||
+      digitalRead(USER_BTN_PIN) == (USER_BTN_ACTIVE_LOW ? LOW : HIGH)) {
+    lora.setDio1Action(setLoraFlag);
+    lora.startReceive();
+    loraInterruptEnabled = true;
+    delay(durationMs);
+    return;
+  }
+
+  gpio_wakeup_enable((gpio_num_t)LORA_DIO1, GPIO_INTR_HIGH_LEVEL);
+  gpio_wakeup_enable((gpio_num_t)USER_BTN_PIN,
+                     USER_BTN_ACTIVE_LOW ? GPIO_INTR_LOW_LEVEL : GPIO_INTR_HIGH_LEVEL);
+  esp_sleep_enable_gpio_wakeup();
+  esp_sleep_enable_timer_wakeup(durationMs * 1000); // microseconds
+  
+  // Enter light sleep (ESP32 ~800µA, SX1262 CAD ~2-3mA = ~4mA total)
+  esp_light_sleep_start();
+  
+  // Check wake reason
+  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+  bool shouldWakeScreen = false;
+  
+  if (cadDetectedFlag || wakeup_reason == ESP_SLEEP_WAKEUP_GPIO) {
+    // Check if CAD actually detected something
+    int scanResult = lora.getChannelScanResult();
+    if (scanResult == RADIOLIB_PREAMBLE_DETECTED) {
+      if (displayOn) {
+        Serial.println("CAD: Signal detected!");
+      }
+      lastUserInteractionMs = millis();  // Reset idle timer
+      shouldWakeScreen = true;           // "turn on" from light sleep on CAD
+    }
+  }
+  cadDetectedFlag = false;
+  
+  // Always return to full RX mode after wake
+  lora.setDio1Action(setLoraFlag);
+  lora.startReceive();
+  loraInterruptEnabled = true;
+
+  // If the wake was from a button click (or CAD) during light sleep, turn the display back on.
+  // (This does NOT show boot logo/vibe; it's not a reboot.)
+  if (!displayOn && wakeup_reason == ESP_SLEEP_WAKEUP_GPIO) {
+    if (digitalRead(USER_BTN_PIN) == (USER_BTN_ACTIVE_LOW ? LOW : HIGH)) {
+      shouldWakeScreen = true;
+    }
+  }
+  if (shouldWakeScreen && !displayOn) {
+    setDisplayOn(true);
+    lastUserInteractionMs = millis();
+  }
+}
+
+void requireWakeHoldIfNeeded() {
+  if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_EXT0) {
+    return;
+  }
+  pinMode(USER_BTN_PIN, INPUT_PULLUP);
+  uint32_t startMs = millis();
+  while (digitalRead(USER_BTN_PIN) == (USER_BTN_ACTIVE_LOW ? LOW : HIGH)) {
+    if (millis() - startMs >= BTN_POWER_HOLD_MS) {
+      return;
+    }
+    delay(10);
+  }
+
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)USER_BTN_PIN, USER_BTN_ACTIVE_LOW ? 0 : 1);
+  esp_deep_sleep_start();
+}
+
 void refreshDisplay() {
   tft.fillScreen(ST77XX_BLACK);
   tft.setTextWrap(false);
@@ -460,20 +734,30 @@ void refreshDisplay() {
   updateDistanceDisplay(lastStep);
 }
 
-void setDisplayOn(bool on, bool refresh = true) {
+void setDisplayOn(bool on, bool refresh) {
   if (displayOn == on) {
     return;
   }
   displayOn = on;
   if (on) {
+    // Exiting light sleep mode.
+    lightSleepMode = false;
     // Clear display before backlight to avoid stale flash
+    digitalWrite(VEXT_CTRL, VEXT_ACTIVE);
+    delay(50);
+    tft.initR(INITR_MINI160x80_PLUGIN);
+    tft.setRotation(1);
     tft.fillScreen(ST77XX_BLACK);
+    tft.setTextWrap(false);
+    tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+    tft.setTextSize(1);
     digitalWrite(TFT_LED_K, HIGH);
     if (refresh) {
       refreshDisplay();
     }
   } else {
     digitalWrite(TFT_LED_K, LOW);
+    digitalWrite(VEXT_CTRL, !VEXT_ACTIVE);
   }
 }
 void flashStatusLed() {
@@ -688,6 +972,7 @@ void vibrationTask(void* parameter) {
 void setup() {
   // Initialize Serial - using USB CDC on ESP32-S3
   Serial.begin(115200);
+  Serial.setDebugOutput(false);
   
   // Wait for USB CDC to be ready
   while(!Serial && millis() < 5000) {
@@ -700,6 +985,18 @@ void setup() {
   Serial.println("\n\n========================================");
   Serial.println("  Wireless Tracker - TFT + LoRa");
   Serial.println("========================================\n");
+  printBootReason();
+
+  // Reduce ESP-IDF/Arduino core log noise (prevents USB-serial ISR overload -> INT_WDT).
+  esp_log_level_set("*", ESP_LOG_ERROR);
+
+  // Require a 3s hold to exit deep sleep
+  requireWakeHoldIfNeeded();
+  const esp_sleep_wakeup_cause_t wakeCause = esp_sleep_get_wakeup_cause();
+  const esp_reset_reason_t resetReason = esp_reset_reason();
+  const bool wokeFromDeepSleep = (wakeCause == ESP_SLEEP_WAKEUP_EXT0);
+  const bool coldBoot = (resetReason == ESP_RST_POWERON);
+  const bool showBootAnim = (coldBoot || wokeFromDeepSleep);
 
   // Seed RNG for ping jitter
   randomSeed((uint32_t)ESP.getEfuseMac());
@@ -716,6 +1013,10 @@ void setup() {
   digitalWrite(VEXT_CTRL, VEXT_ACTIVE);
   delay(100);
 
+  // Hold GNSS in reset (we don't use it)
+  pinMode(GNSS_RST_PIN, OUTPUT);
+  digitalWrite(GNSS_RST_PIN, LOW);
+
   // Enable TFT backlight (polarity may vary by board)
   pinMode(TFT_LED_K, OUTPUT);
   digitalWrite(TFT_LED_K, LOW);
@@ -726,6 +1027,12 @@ void setup() {
   // Setup user button
   pinMode(USER_BTN_PIN, INPUT_PULLUP);
 
+  // Setup battery ADC
+  pinMode(ADC_CTRL_PIN, OUTPUT);
+  digitalWrite(ADC_CTRL_PIN, LOW);
+  analogReadResolution(12);
+  analogSetPinAttenuation(ADC_BAT_PIN, ADC_11db);
+
   // Setup status LED
   pinMode(STATUS_LED_PIN, OUTPUT);
   digitalWrite(STATUS_LED_PIN, LOW);
@@ -734,14 +1041,6 @@ void setup() {
   tft.initR(INITR_MINI160x80_PLUGIN);
   tft.setRotation(1);
   tft.fillScreen(ST77XX_BLACK);
-
-  // Draw boot logo
-  uiSetting = UI_VIBE;
-  updateUiSelectionDisplay();
-  setDisplayOn(true, false);
-  showHumnLogo();
-  delay(1000);
-  refreshDisplay();
 
   Serial.println("TFT init complete.");
 
@@ -781,21 +1080,21 @@ void setup() {
     Serial.print(" SCL=");
     Serial.println(I2C_SCL);
     Serial.println("Button cycles intensity: soft/medium/hard/max");
-
-    // Startup vibration sweep (low -> high) ~0.5s total
-    const uint32_t sweepMs = 500;
-    const uint8_t steps = 20;
-    for (uint8_t i = 0; i < steps; i++) {
-      float t = (steps <= 1) ? 1.0f : (float)i / (float)(steps - 1);
-      uint8_t intensity = (uint8_t)round(20.0f + t * (127.0f - 20.0f));
-      drv.setRealtimeValue(intensity);
-      delay(sweepMs / steps);
-    }
-    drv.setRealtimeValue(0);
   } else {
     Serial.println("DRV2605L init FAILED.");
     Serial.println("Check wiring + power. DRV2605L addr is 0x5A or 0x5B.");
   }
+
+  // Draw boot logo + vibration
+  uiSetting = UI_VIBE;
+  updateUiSelectionDisplay();
+  setDisplayOn(true, false);
+  if (showBootAnim) {
+    showHumnLogo();
+    playBootVibration();
+    delay(500);
+  }
+  refreshDisplay();
 
   updateSimDisplay();
 
@@ -897,48 +1196,33 @@ void loop() {
     btnPressStartMs = nowMs;
     btnHoldHandled = false;
     btnPowerHandled = false;
+    // Treat press as user activity immediately so the display timeout can't
+    // turn the screen off mid-press (which can make the release look like a "wake").
+    lastUserInteractionMs = nowMs;
   }
 
   if (btnPressed && btnPressStartMs != 0) {
     uint32_t heldMs = nowMs - btnPressStartMs;
 
     if (heldMs >= BTN_POWER_HOLD_MS && !btnPowerHandled) {
-      deviceOn = !deviceOn;
       btnPowerHandled = true;
-      if (deviceOn) {
-        setDisplayOn(true, false);
-        uiSetting = UI_VIBE;
-        updateUiSelectionDisplay();
-        showHumnLogo();
-        delay(1000);
-        refreshDisplay();
-      } else {
-        if (!displayOn) {
-          setDisplayOn(true);
-        }
-        showSleepCat();
-        delay(1000);
-        setDisplayOn(false);
-      }
       lastUserInteractionMs = nowMs;
-      if (!deviceOn && drvOk) {
-        drv.setRealtimeValue(0);
-        motorStopMs = 0;
-        vibeOn = false;
-      }
       // Power action triggers immediately; ignore release for this hold.
       btnPressStartMs = 0;
+      enterDeepSleep();
     } else if (deviceOn && displayOn && heldMs >= BTN_HOLD_MS && !btnHoldHandled) {
       // Long-press: cycle which setting is being edited
       btnHoldHandled = true;
       uiSetting = (uiSetting + 1) % 5;
 
-      Serial.print("Edit setting: ");
-      if (uiSetting == UI_VIBE) Serial.println("vibe");
-      else if (uiSetting == UI_PING) Serial.println("ping");
-      else if (uiSetting == UI_FEEDBACK) Serial.println("feedback");
-      else if (uiSetting == UI_SIM) Serial.println("sim");
-      else Serial.println("scale");
+      if (verboseUiLogs && Serial) {
+        Serial.print("Edit setting: ");
+        if (uiSetting == UI_VIBE) Serial.println("vibe");
+        else if (uiSetting == UI_PING) Serial.println("ping");
+        else if (uiSetting == UI_FEEDBACK) Serial.println("feedback");
+        else if (uiSetting == UI_SIM) Serial.println("sim");
+        else Serial.println("scale");
+      }
       updateUiSelectionDisplay();
       saveSettings();
       requestHapticStep = 0;
@@ -964,31 +1248,39 @@ void loop() {
         const char* label = (intensityMode == 0) ? "soft" :
                             (intensityMode == 1) ? "medium" :
                             (intensityMode == 2) ? "hard" : "max";
-        Serial.print("Intensity mode: ");
-        Serial.println(label);
+        if (verboseUiLogs && Serial) {
+          Serial.print("Intensity mode: ");
+          Serial.println(label);
+        }
         updateIntensityDisplay();
         saveSettings();
       } else if (uiSetting == UI_PING) {
         pingRateIndex = (pingRateIndex + 1) % (sizeof(PING_RATES_MS) / sizeof(PING_RATES_MS[0]));
         pingBaseMs = PING_RATES_MS[pingRateIndex];
         pingJitterMs = max<uint32_t>(10, pingBaseMs / 4);
-        Serial.print("Ping rate: ");
-        Serial.print(pingBaseMs);
-        Serial.println(" ms");
+        if (verboseUiLogs && Serial) {
+          Serial.print("Ping rate: ");
+          Serial.print(pingBaseMs);
+          Serial.println(" ms");
+        }
         updatePingRateDisplay();
         saveSettings();
       } else if (uiSetting == UI_FEEDBACK) {
         feedbackMode = (FeedbackMode)((feedbackMode + 1) % 3);
-        Serial.print("Feedback mode: ");
-        if (feedbackMode == FEEDBACK_PULSED_RATE) Serial.println("pulsed");
-        else if (feedbackMode == FEEDBACK_PULSE_ON_RX) Serial.println("rx-pulse");
-        else Serial.println("constant");
+        if (verboseUiLogs && Serial) {
+          Serial.print("Feedback mode: ");
+          if (feedbackMode == FEEDBACK_PULSED_RATE) Serial.println("pulsed");
+          else if (feedbackMode == FEEDBACK_PULSE_ON_RX) Serial.println("rx-pulse");
+          else Serial.println("constant");
+        }
         updateFeedbackDisplay();
         saveSettings();
       } else if (uiSetting == UI_SIM) {
         simulateDistance = !simulateDistance;
-        Serial.print("Sim mode: ");
-        Serial.println(simulateDistance ? "on" : "off");
+        if (verboseUiLogs && Serial) {
+          Serial.print("Sim mode: ");
+          Serial.println(simulateDistance ? "on" : "off");
+        }
 
         updateSimDisplay();
         saveSettings();
@@ -996,9 +1288,11 @@ void loop() {
         // Distance scale: 1.0x .. 3.0x in 0.1 steps
         distanceScaleIndex++;
         if (distanceScaleIndex > 30) distanceScaleIndex = 10;
-        Serial.print("Scale: ");
-        Serial.print(distanceScaleIndex / 10.0f, 1);
-        Serial.println("x");
+        if (verboseUiLogs && Serial) {
+          Serial.print("Scale: ");
+          Serial.print(distanceScaleIndex / 10.0f, 1);
+          Serial.println("x");
+        }
         updateScaleDisplay();
         saveSettings();
       }
@@ -1014,14 +1308,30 @@ void loop() {
 
   // Send ping with jitter to reduce collisions
   uint32_t now = millis();
+  uint32_t effectivePingBaseMs = pingBaseMs;
+  uint32_t effectivePingJitterMs = pingJitterMs;
+  if (!displayOn && role == ROLE_SEARCH) {
+    effectivePingBaseMs = SEARCH_SLEEP_PING_MS;
+    effectivePingJitterMs = max<uint32_t>(10, effectivePingBaseMs / 4);
+  }
+
+  if (role == ROLE_SEARCH && !displayOn && (nextPingMs == 0 || nextPingMs > now + effectivePingBaseMs)) {
+    nextPingMs = now + effectivePingBaseMs + random(0, effectivePingJitterMs);
+  }
 
   // Warn if we're late sending a ping (only when we are supposed to ping)
   if (role != ROLE_RESPONDER && nextPingMs != 0 && now > nextPingMs + PING_LATE_WARN_MS) {
-    Serial.print("Ping late by ");
-    Serial.print(now - nextPingMs);
-    Serial.println(" ms");
+    // Throttle this log heavily; at fast ping rates it can create a feedback loop
+    // (printing makes loop slower => always "late" => prints constantly => WDT).
+    if (verboseTimingLogs && displayOn && Serial &&
+        (now - lastPingLateLogMs > PING_LATE_LOG_THROTTLE_MS)) {
+      lastPingLateLogMs = now;
+      Serial.print("Ping late by ");
+      Serial.print(now - nextPingMs);
+      Serial.println(" ms");
+    }
     // avoid spamming: move the schedule forward
-    nextPingMs = now + pingBaseMs + random(0, pingJitterMs);
+    nextPingMs = now + effectivePingBaseMs + random(0, effectivePingJitterMs);
   }
 
   // Signal timeout: return to search + clear distance display
@@ -1038,7 +1348,7 @@ void loop() {
   if (now >= nextPingMs) {
     // In SEARCH mode, avoid pinging right after RX to reduce collisions
     if (role == ROLE_SEARCH && now - lastSignalMs < 400) {
-      nextPingMs = now + pingBaseMs + random(0, pingJitterMs);
+      nextPingMs = now + effectivePingBaseMs + random(0, effectivePingJitterMs);
     } else if (role == ROLE_SEARCH || role == ROLE_PINGER) {
       pingCounter++;
 
@@ -1054,18 +1364,19 @@ void loop() {
       // No TFT updates on every TX to reduce jitter
       flashStatusLed();
 
-      if (lastPingSentMs != 0 && (pingCounter % pingIntervalLogEvery == 0)) {
+      if (verboseTimingLogs && displayOn && Serial &&
+          lastPingSentMs != 0 && (pingCounter % pingIntervalLogEvery == 0)) {
         Serial.print("Ping interval: ");
         Serial.print(now - lastPingSentMs);
         Serial.println(" ms");
       }
-      if (txDurMs > TX_WARN_MS) {
+      if (verboseTimingLogs && displayOn && Serial && txDurMs > TX_WARN_MS) {
         Serial.print("TX duration: ");
         Serial.print(txDurMs);
         Serial.println(" ms");
       }
       lastPingSentMs = now;
-      nextPingMs = now + pingBaseMs + random(0, pingJitterMs);
+      nextPingMs = now + effectivePingBaseMs + random(0, effectivePingJitterMs);
     }
   }
 
@@ -1075,9 +1386,18 @@ void loop() {
     lastRxMs = millis();
   }
 
+  // Battery display update
+  if (deviceOn && displayOn && (now - lastBatteryReadMs > 1000)) {
+    lastBatteryReadMs = now;
+    updateBatteryDisplay(false);
+  }
+
   // Display idle timeout
-  if (displayOn && (millis() - lastUserInteractionMs > DISPLAY_IDLE_MS)) {
+  // Don't auto-sleep the display while the button is held.
+  if (displayOn && !btnPressed && (millis() - lastUserInteractionMs > DISPLAY_IDLE_MS)) {
     setDisplayOn(false);
+    // Light sleep mode begins only when the display times out.
+    lightSleepMode = true;
   }
 
   // LED pulse off
@@ -1085,5 +1405,18 @@ void loop() {
   if (LED_ENABLED && ledOn && millis() > ledOffMs) {
     digitalWrite(STATUS_LED_PIN, LOW);
     ledOn = false;
+  }
+
+  // Power saving: use light sleep with CAD when idle
+  if (powerSaveMode && lightSleepMode && !displayOn && deviceOn) {
+    uint32_t idleTime = millis() - lastUserInteractionMs;
+    
+    // If we've been idle a while and no recent signal, enter light sleep
+    // This saves power while still monitoring for incoming signals
+    if (idleTime > 5000 && (millis() - lastSignalMs) > 1000) {
+      // Enter light sleep with CAD monitoring
+      // The LoRa module will wake us if it detects a signal
+      enterLightSleepWithCAD(CAD_CHECK_INTERVAL_MS);
+    }
   }
 }
