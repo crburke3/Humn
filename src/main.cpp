@@ -86,6 +86,14 @@ static const uint32_t IDLE_LIGHT_SLEEP_MS = 30000;  // Enter light sleep after t
 static const uint32_t IDLE_DEEP_SLEEP_MS = 300000;  // Enter deep sleep after 5 min idle
 static bool powerSaveMode = true;  // Enable CAD-based power saving
 
+// Temporary development switch: disable all sleep behaviors (display idle off,
+// light sleep/CAD, and deep sleep via long-press).
+#if defined(HUMN_DISABLE_SLEEP) && (HUMN_DISABLE_SLEEP)
+static const bool sleepEnabled = false;
+#else
+static const bool sleepEnabled = true;
+#endif
+
 SPIClass spiLoRa(FSPI);
 SX1262 lora = new Module(LORA_NSS, LORA_DIO1, LORA_RST, LORA_BUSY, spiLoRa);
 
@@ -570,6 +578,9 @@ void playBootVibration() {
 }
 
 void enterDeepSleep() {
+  if (!sleepEnabled) {
+    return;
+  }
   playBootVibration();
   requestHapticPulse = false;
   hapticPreviewUntilMs = 0;
@@ -600,6 +611,10 @@ void enterDeepSleep() {
 
 // Enter light sleep with CAD monitoring for power savings
 void enterLightSleepWithCAD(uint32_t durationMs) {
+  if (!sleepEnabled) {
+    delay(durationMs);
+    return;
+  }
   if (!powerSaveMode) {
     delay(durationMs);
     return;
@@ -701,6 +716,9 @@ void enterLightSleepWithCAD(uint32_t durationMs) {
 }
 
 void requireWakeHoldIfNeeded() {
+  if (!sleepEnabled) {
+    return;
+  }
   if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_EXT0) {
     return;
   }
@@ -1394,7 +1412,7 @@ void loop() {
 
   // Display idle timeout
   // Don't auto-sleep the display while the button is held.
-  if (displayOn && !btnPressed && (millis() - lastUserInteractionMs > DISPLAY_IDLE_MS)) {
+  if (sleepEnabled && displayOn && !btnPressed && (millis() - lastUserInteractionMs > DISPLAY_IDLE_MS)) {
     setDisplayOn(false);
     // Light sleep mode begins only when the display times out.
     lightSleepMode = true;
@@ -1408,7 +1426,7 @@ void loop() {
   }
 
   // Power saving: use light sleep with CAD when idle
-  if (powerSaveMode && lightSleepMode && !displayOn && deviceOn) {
+  if (sleepEnabled && powerSaveMode && lightSleepMode && !displayOn && deviceOn) {
     uint32_t idleTime = millis() - lastUserInteractionMs;
     
     // If we've been idle a while and no recent signal, enter light sleep
