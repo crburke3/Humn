@@ -135,6 +135,7 @@ static FeedbackMode feedbackMode = FEEDBACK_PULSED_RATE;
 static TaskHandle_t vibeTaskHandle = nullptr;
 static volatile bool requestHapticPulse = false;
 static volatile int requestHapticStep = 0;
+static volatile bool hapticsEnabled = true;
 static uint32_t lastRxMs = 0;
 static uint32_t lastSignalMs = 0;
 static const uint32_t PING_RATES_MS[] = {1000, 800, 600, 400, 300, 200, 100, 50};
@@ -307,14 +308,10 @@ void updateIntensityDisplay() {
   updateBatteryDisplay(true);
 }
 
-void updatePingRateDisplay() {
-  tft.fillRect(0, 12, 160, 12, ST77XX_BLACK);
-}
-
 void updateFeedbackDisplay() {
-  tft.fillRect(0, 24, 160, 12, ST77XX_BLACK);
+  tft.fillRect(0, 12, 160, 12, ST77XX_BLACK);
   tft.setTextSize(1);
-  tft.setCursor(0, 24);
+  tft.setCursor(0, 12);
   tft.print("Mode: ");
   if (feedbackMode == FEEDBACK_PULSED_RATE) {
     tft.print("pulsed");
@@ -326,9 +323,9 @@ void updateFeedbackDisplay() {
 }
 
 void updateUiSelectionDisplay() {
-  tft.fillRect(0, 72, 160, 12, ST77XX_BLACK);
+  tft.fillRect(0, 60, 160, 12, ST77XX_BLACK);
   tft.setTextSize(1);
-  tft.setCursor(0, 72);
+  tft.setCursor(0, 60);
   tft.print("Edit: ");
   if (uiSetting == UI_VIBE) tft.print("vibe");
   else if (uiSetting == UI_FEEDBACK) tft.print("feedback");
@@ -337,17 +334,17 @@ void updateUiSelectionDisplay() {
 }
 
 void updateSimDisplay() {
-  tft.fillRect(0, 48, 160, 12, ST77XX_BLACK);
+  tft.fillRect(0, 36, 160, 12, ST77XX_BLACK);
   tft.setTextSize(1);
-  tft.setCursor(0, 48);
+  tft.setCursor(0, 36);
   tft.print("Sim: ");
   tft.print(simulateDistance ? "on" : "off");
 }
 
 void updateScaleDisplay() {
-  tft.fillRect(0, 60, 160, 12, ST77XX_BLACK);
+  tft.fillRect(0, 48, 160, 12, ST77XX_BLACK);
   tft.setTextSize(1);
-  tft.setCursor(0, 60);
+  tft.setCursor(0, 48);
   tft.print("Scale: ");
   tft.print(distanceScaleIndex / 10.0f, 1);
   tft.print("x");
@@ -385,9 +382,9 @@ void updateDistanceDisplay(int step) {
     return;
   }
   lastBand = band;
-  tft.fillRect(0, 36, 160, 12, ST77XX_BLACK);
+  tft.fillRect(0, 24, 160, 12, ST77XX_BLACK);
   tft.setTextSize(1);
-  tft.setCursor(0, 36);
+  tft.setCursor(0, 24);
   tft.print("Dist: ");
   tft.print(distanceCategoryLabel(band));
 }
@@ -583,7 +580,17 @@ void enterDeepSleep() {
   if (!manualDeepSleepEnabled) {
     return;
   }
-  playBootVibration();
+  // Stop radio activity ASAP so we don't process new events during shutdown.
+  loraInterruptEnabled = false;
+  lora.sleep();
+
+  // Ensure haptics are fully off before deep sleep. Without this, the vibration
+  // task can keep reasserting motor drive during the sleep transition window,
+  // and the DRV2605 can continue vibrating into deep sleep.
+  hapticsEnabled = false;
+  if (vibeTaskHandle != nullptr) {
+    vTaskSuspend(vibeTaskHandle);
+  }
   requestHapticPulse = false;
   hapticPreviewUntilMs = 0;
   motorStopMs = 0;
@@ -592,6 +599,15 @@ void enterDeepSleep() {
     drv.setRealtimeValue(0);
     delay(20);
     drv.setRealtimeValue(0);
+    // Force DRV2605(L) into standby (bit 6 of MODE register 0x01).
+    // Adafruit library doesn't expose a STANDBY constant, so do it directly.
+    // Safe to attempt both common addresses (0x5A / 0x5B).
+    for (uint8_t addr : { (uint8_t)0x5A, (uint8_t)0x5B }) {
+      Wire.beginTransmission(addr);
+      Wire.write((uint8_t)0x01);
+      Wire.write((uint8_t)0x40);
+      Wire.endTransmission();
+    }
   }
   showSleepCat();
   delay(1000);
@@ -599,8 +615,6 @@ void enterDeepSleep() {
   lightSleepMode = false;
   setDisplayOn(false);
   digitalWrite(VEXT_CTRL, !VEXT_ACTIVE);
-  loraInterruptEnabled = false;
-  lora.sleep();
   // Best-effort radio shutdown for maximum power savings.
   // (WiFi/BLE are not used in normal operation, but explicitly disable anyway.)
   WiFi.disconnect(true, true);
@@ -724,11 +738,10 @@ void refreshDisplay() {
   tft.setTextSize(1);
 
   updateIntensityDisplay();
-  updatePingRateDisplay();
   updateFeedbackDisplay();
-  updateUiSelectionDisplay();
   updateSimDisplay();
   updateScaleDisplay();
+  updateUiSelectionDisplay();
 
   lastBand = (DistanceBand)255;
   updateDistanceDisplay(lastStep);
@@ -892,6 +905,16 @@ void vibrationTask(void* parameter) {
   for (;;) {
     if (drvOk) {
       uint32_t now = millis();
+
+      if (!hapticsEnabled) {
+        if (motorStopMs != 0 || vibeOn) {
+          drv.setRealtimeValue(0);
+          motorStopMs = 0;
+          vibeOn = false;
+        }
+        vTaskDelay(delayTicks);
+        continue;
+      }
 
       if (!deviceOn) {
         if (motorStopMs != 0 || vibeOn) {
