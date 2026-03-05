@@ -10,6 +10,7 @@
 #include <esp_system.h>
 #include <esp_log.h>
 #include <WiFi.h>
+#include <math.h>
 
 // Heltec Wireless Tracker V1.1 TFT pins (from datasheet)
 // TFT: ST7735 160x80, SPI interface
@@ -55,6 +56,7 @@ enum UiSetting : uint8_t {
 
 void updateBatteryDisplay(bool force = false);
 void setDisplayOn(bool on, bool refresh = true);
+int estimateDistanceStep(int16_t rssiDbm);
 
 // Status LED
 static const int STATUS_LED_PIN = 18;
@@ -192,9 +194,281 @@ static uint32_t nextVibeToggleMs = 0;
 static int lastStep = 19;
 static float smoothedRssi = -100.0f;
 static const float RSSI_SMOOTH_ALPHA = 0.10f;
+static float smoothedDistanceFt = 2000.0f;
+static const float DIST_SMOOTH_ALPHA = 0.15f;
 static bool vibeOn = false;
 static float smoothedIntervalMs = 600.0f;
 static const float INTERVAL_SMOOTH_ALPHA = 0.20f;
+
+// Distance estimate model (log-distance path loss).
+// Tune these two constants if you want the feet ranges to align better in your environment.
+static const float RSSI_AT_1M_DBM = -48.0f;
+static const float PATH_LOSS_EXPONENT = 2.4f; // indoor-ish default; higher => distance grows faster for same RSSI
+
+static inline float feetFromMeters(float m) { return m * 3.28084f; }
+static inline float metersFromFeet(float ft) { return ft / 3.28084f; }
+
+static float estimateDistanceFeetFromRssi(int16_t rssiDbm) {
+  float n = PATH_LOSS_EXPONENT;
+  if (n < 1.0f) n = 1.0f;
+  // d(m) = 10 ^ ((RSSI@1m - RSSI) / (10*n))
+  float expv = (RSSI_AT_1M_DBM - (float)rssiDbm) / (10.0f * n);
+  float dMeters = powf(10.0f, expv);
+  if (!isfinite(dMeters) || dMeters < 0.01f) dMeters = 0.01f;
+  float dFt = feetFromMeters(dMeters);
+  if (!isfinite(dFt) || dFt < 0.0f) dFt = 0.0f;
+  // Prevent absurd growth if RSSI is very low/noisy
+  if (dFt > 50000.0f) dFt = 50000.0f;
+  return dFt;
+}
+
+static int16_t estimateRssiFromDistanceFeet(float distFt) {
+  float dMeters = metersFromFeet(distFt);
+  if (dMeters < 0.01f) dMeters = 0.01f;
+  float n = PATH_LOSS_EXPONENT;
+  if (n < 1.0f) n = 1.0f;
+  float rssi = RSSI_AT_1M_DBM - 10.0f * n * log10f(dMeters);
+  if (!isfinite(rssi)) rssi = -120.0f;
+  if (rssi > -5.0f) rssi = -5.0f;
+  if (rssi < -130.0f) rssi = -130.0f;
+  return (int16_t)round(rssi);
+}
+
+// "Windowed" haptics: treat each distance window as its own scaling range.
+// As you move closer within a window, intensity ramps up and interval ramps down.
+// When you cross into a new window, scaling resets and we play a short ramp
+// (up when moving closer, down when moving farther).
+enum HapticWindow : uint8_t {
+  WIN_CLOSE = 0,
+  WIN_MED = 1,
+  WIN_FAR = 2,
+  WIN_VERY_FAR = 3
+};
+
+struct HapticWindowSpec {
+  float distMinFt; // closest distance in this window
+  float distMaxFt; // farthest distance in this window
+  uint8_t intensityMin; // base realtime intensity (0..127) at far edge
+  uint8_t intensityMax; // base realtime intensity (0..127) at near edge
+  uint32_t intervalMaxMs; // pulse interval at far edge (slower)
+  uint32_t intervalMinMs; // pulse interval at near edge (faster)
+  float onRatioMin; // duty at far edge
+  float onRatioMax; // duty at near edge
+};
+
+static const HapticWindowSpec HAPTIC_WINDOWS[] = {
+  // NOTE: Per your request, EVERY window spans the full intensity range.
+  // The "feel" of each window is differentiated mostly by interval + duty.
+  // WIN_CLOSE (0..20 ft): fastest
+  { 1.0f, 20.0f, 0, 127, 600, 150, 0.40f, 0.85f },
+  // WIN_MED (20..100 ft)
+  { 20.0f, 100.0f, 0, 127, 800, 220, 0.32f, 0.70f },
+  // WIN_FAR (100..400 ft)
+  { 100.0f, 400.0f, 0, 127, 900, 320, 0.25f, 0.55f },
+  // WIN_VERY_FAR (400+ ft): slowest
+  { 400.0f, 2000.0f, 0, 127, 1100, 700, 0.20f, 0.30f },
+};
+
+static HapticWindow currentHapticWindow = WIN_VERY_FAR;
+static uint32_t lastHapticWindowChangeMs = 0;
+static float lastWindowDistanceFt = 2000.0f;
+
+static const uint32_t WINDOW_RSSI_AVG_MS = 2000;
+static const uint8_t RSSI_HISTORY_MAX = 64; // enough for ~2s at >=30ms updates
+struct RssiSample {
+  int16_t rssiDbm;
+  uint32_t tMs;
+};
+static RssiSample rssiHistory[RSSI_HISTORY_MAX];
+static uint8_t rssiHistoryHead = 0;
+static uint8_t rssiHistoryCount = 0;
+
+struct HapticTransitionRequest {
+  volatile bool pending;
+  volatile uint8_t fromIntensity;
+  volatile uint8_t toIntensity;
+  volatile uint8_t pattern; // 0 = up, 1 = down
+  volatile uint16_t durationMs;
+};
+static HapticTransitionRequest hapticTransitionReq = { false, 0, 0, 0, 1400 };
+
+static inline float clamp01(float x) {
+  if (x < 0.0f) return 0.0f;
+  if (x > 1.0f) return 1.0f;
+  return x;
+}
+
+static inline float lerpFloat(float a, float b, float t) {
+  return a + (b - a) * t;
+}
+
+static inline uint8_t lerpU8(uint8_t a, uint8_t b, float t) {
+  float v = lerpFloat((float)a, (float)b, t);
+  if (v < 0.0f) v = 0.0f;
+  if (v > 127.0f) v = 127.0f;
+  return (uint8_t)round(v);
+}
+
+static HapticWindow hapticWindowFromDistanceFeet(float distFt) {
+  if (distFt <= 20.0f) return WIN_CLOSE;
+  if (distFt <= 100.0f) return WIN_MED;
+  if (distFt <= 400.0f) return WIN_FAR;
+  return WIN_VERY_FAR;
+}
+
+const HapticWindowSpec& hapticWindowSpec(HapticWindow w) {
+  return HAPTIC_WINDOWS[(uint8_t)w];
+}
+
+static float hapticWindowProgressDistance(float distFt, const HapticWindowSpec& spec) {
+  // 0.0 at far edge (distMax), 1.0 at near edge (distMin)
+  float minFt = spec.distMinFt;
+  float maxFt = spec.distMaxFt;
+  if (maxFt <= minFt) {
+    return 1.0f;
+  }
+  if (distFt < minFt) distFt = minFt;
+  if (distFt > maxFt) distFt = maxFt;
+  float t = (maxFt - distFt) / (maxFt - minFt);
+  return clamp01(t);
+}
+
+uint8_t applyUserIntensityMode(uint8_t intensity) {
+  // Preserve the full 0..127 range, but change the response curve.
+  // soft = less sensitive (more compression at low end)
+  // max = linear
+  float x = (float)intensity / 127.0f;
+  x = clamp01(x);
+  float gamma = 1.0f;
+  switch (intensityMode) {
+    case 0: gamma = 2.4f; break;  // soft
+    case 1: gamma = 1.7f; break;  // medium
+    case 2: gamma = 1.25f; break; // hard
+    case 3: default: gamma = 1.0f; break; // max
+  }
+  float y = (gamma == 1.0f) ? x : powf(x, gamma);
+  y = clamp01(y);
+  return (uint8_t)round(y * 127.0f);
+}
+
+uint8_t motorIntensityForDistanceInWindow(float distFt, HapticWindow w) {
+  const auto& spec = hapticWindowSpec(w);
+  float t = hapticWindowProgressDistance(distFt, spec);
+  uint8_t base = lerpU8(spec.intensityMin, spec.intensityMax, t);
+  return applyUserIntensityMode(base);
+}
+
+uint8_t motorIntensityForStepWindowed(int step) {
+  (void)step;
+  return motorIntensityForDistanceInWindow(smoothedDistanceFt, currentHapticWindow);
+}
+
+uint32_t vibrationIntervalForDistanceInWindow(float distFt, HapticWindow w) {
+  const auto& spec = hapticWindowSpec(w);
+  float t = hapticWindowProgressDistance(distFt, spec);
+  float interval = lerpFloat((float)spec.intervalMaxMs, (float)spec.intervalMinMs, t);
+  if (interval < 40.0f) interval = 40.0f;
+  return (uint32_t)round(interval);
+}
+
+uint32_t vibrationIntervalForStepWindowed(int step) {
+  (void)step;
+  return vibrationIntervalForDistanceInWindow(smoothedDistanceFt, currentHapticWindow);
+}
+
+float vibrationOnRatioForDistanceInWindow(float distFt, HapticWindow w) {
+  const auto& spec = hapticWindowSpec(w);
+  float t = hapticWindowProgressDistance(distFt, spec);
+  float ratio = lerpFloat(spec.onRatioMin, spec.onRatioMax, t);
+  if (ratio < 0.10f) ratio = 0.10f;
+  if (ratio > 0.95f) ratio = 0.95f;
+  return ratio;
+}
+
+float vibrationOnRatioForStepWindowed(int step) {
+  (void)step;
+  return vibrationOnRatioForDistanceInWindow(smoothedDistanceFt, currentHapticWindow);
+}
+
+uint8_t windowFloorIntensity(HapticWindow w) {
+  return applyUserIntensityMode(hapticWindowSpec(w).intensityMin);
+}
+
+uint8_t windowPeakIntensity(HapticWindow w) {
+  return applyUserIntensityMode(hapticWindowSpec(w).intensityMax);
+}
+
+static void recordRssiSample(int16_t rssiDbm, uint32_t nowMs) {
+  rssiHistory[rssiHistoryHead] = { rssiDbm, nowMs };
+  rssiHistoryHead = (uint8_t)((rssiHistoryHead + 1) % RSSI_HISTORY_MAX);
+  if (rssiHistoryCount < RSSI_HISTORY_MAX) {
+    rssiHistoryCount++;
+  }
+}
+
+static int16_t averageRssiLastMs(uint32_t nowMs, uint32_t windowMs, int16_t fallback) {
+  if (rssiHistoryCount == 0) {
+    return fallback;
+  }
+  int32_t sum = 0;
+  int32_t n = 0;
+  for (uint8_t i = 0; i < rssiHistoryCount; i++) {
+    // Walk backwards from newest
+    int idx = (int)rssiHistoryHead - 1 - (int)i;
+    if (idx < 0) idx += RSSI_HISTORY_MAX;
+    const RssiSample& s = rssiHistory[idx];
+    if (nowMs - s.tMs <= windowMs) {
+      sum += (int32_t)s.rssiDbm;
+      n++;
+    } else {
+      // older samples will only be older; stop early
+      break;
+    }
+  }
+  if (n <= 0) {
+    return fallback;
+  }
+  return (int16_t)round((float)sum / (float)n);
+}
+
+static void resetRssiAverager() {
+  rssiHistoryCount = 0;
+  rssiHistoryHead = 0;
+}
+
+static void onHapticWindowChanged(HapticWindow oldW, HapticWindow newW) {
+  uint32_t now = millis();
+  // Debounce window changes to avoid jitter-triggered ramps at thresholds.
+  if (now - lastHapticWindowChangeMs < 300) return;
+  lastHapticWindowChangeMs = now;
+
+  bool movingCloser = ((uint8_t)newW < (uint8_t)oldW);
+  uint8_t fromI = motorIntensityForDistanceInWindow(smoothedDistanceFt, oldW);
+  uint8_t toI = movingCloser ? windowPeakIntensity(newW) : windowFloorIntensity(newW);
+  // Start transitions from silence if we'd otherwise be off (better perceptual cue).
+  if (!vibeOn) {
+    fromI = 0;
+  }
+
+  hapticTransitionReq.fromIntensity = fromI;
+  hapticTransitionReq.toIntensity = toI;
+  hapticTransitionReq.pattern = movingCloser ? 0 : 1;
+  hapticTransitionReq.durationMs = movingCloser ? 1400 : 1600;
+  hapticTransitionReq.pending = true;
+}
+
+static void updateHapticWindowFromAvgRssi(uint32_t nowMs) {
+  int16_t avgRssi = averageRssiLastMs(nowMs, WINDOW_RSSI_AVG_MS, lastRssi);
+  float avgDistFt = estimateDistanceFeetFromRssi(avgRssi);
+  lastWindowDistanceFt = avgDistFt;
+  HapticWindow newW = hapticWindowFromDistanceFeet(avgDistFt);
+  if (newW != currentHapticWindow) {
+    HapticWindow oldW = currentHapticWindow;
+    // Trigger transition before switching the active window.
+    onHapticWindowChanged(oldW, newW);
+    currentHapticWindow = newW;
+  }
+}
 
 // Watchdog: re-enter RX mode if we go quiet
 static const uint32_t RX_WATCHDOG_MS = 3000;
@@ -222,8 +496,12 @@ static bool humnLogoBuilt = false;
 
 
 // Simulation mode: cycles distance without RF (user-toggle)
-static const uint32_t SIM_PHASE_MS = 10000;
-static const uint32_t SIM_CYCLE_MS = SIM_PHASE_MS * 3;
+static const uint32_t SIM_HOLD_OUTER_MS = 10000; // "None"
+static const uint32_t SIM_RAMP_MS = 30000;       // None -> Very Close (and reverse)
+static const uint32_t SIM_HOLD_INNER_MS = 10000; // Very Close hold
+static const uint32_t SIM_CYCLE_MS = SIM_HOLD_OUTER_MS + SIM_RAMP_MS + SIM_HOLD_INNER_MS + SIM_RAMP_MS;
+static const float SIM_NEAR_FT = 2.0f;
+static const float SIM_FAR_FT = 800.0f; // put it well into the 400+ ft bucket
 
 void IRAM_ATTR setLoraFlag() {
   if (!loraInterruptEnabled) {
@@ -358,6 +636,7 @@ enum DistanceBand : uint8_t {
 };
 
 static DistanceBand lastBand = BAND_NONE;
+static uint32_t lastDistanceNumericUpdateMs = 0;
 
 const char* distanceCategoryLabel(DistanceBand band) {
   switch (band) {
@@ -369,24 +648,47 @@ const char* distanceCategoryLabel(DistanceBand band) {
 }
 
 DistanceBand distanceBandFromStep(int step) {
-  if (step >= 18) return BAND_NONE;
-  if (step >= 13) return BAND_FAR;
-  if (step >= 7) return BAND_MED;
-  return BAND_CLOSE;
+  (void)step;
+  // "None" should mean "no recent signal", not "very far".
+  if (millis() - lastSignalMs > VIBE_TIMEOUT_MS) {
+    return BAND_NONE;
+  }
+  if (currentHapticWindow == WIN_CLOSE) return BAND_CLOSE;
+  if (currentHapticWindow == WIN_MED) return BAND_MED;
+  // FAR + VERY_FAR both show as "far" in the UI (limited space).
+  return BAND_FAR;
 }
 
 void updateDistanceDisplay(int step) {
-  // Add hysteresis by only updating when the band changes
+  // Add hysteresis by only updating when the band changes.
+  // Also refresh periodically so the numeric distance is visible.
   DistanceBand band = distanceBandFromStep(step);
-  if (band == lastBand) {
+  uint32_t now = millis();
+  bool periodicUpdate = displayOn && (now - lastDistanceNumericUpdateMs >= 1000);
+  if (band == lastBand && !periodicUpdate) {
     return;
   }
   lastBand = band;
+  lastDistanceNumericUpdateMs = now;
   tft.fillRect(0, 24, 160, 12, ST77XX_BLACK);
   tft.setTextSize(1);
   tft.setCursor(0, 24);
   tft.print("Dist: ");
   tft.print(distanceCategoryLabel(band));
+
+  // Always append the calculated distance so it's easier to interpret windowing.
+  // Keep it short to fit on the 160px line.
+  float ft = smoothedDistanceFt;
+  tft.print(" ");
+  if (!isfinite(ft) || ft < 0.0f) {
+    tft.print("--");
+  } else {
+    int shownFt = (ft < 100.0f) ? (int)round(ft)
+                 : (ft < 1000.0f) ? (int)round(ft / 10.0f) * 10
+                 : (int)round(ft / 50.0f) * 50;
+    tft.print(shownFt);
+    tft.print("ft");
+  }
 }
 
 float readBatteryVoltage() {
@@ -790,28 +1092,68 @@ void updateSimulatedDistance() {
   lastSimUpdateMs = now;
   uint32_t t = now % SIM_CYCLE_MS;
 
-  if (t < SIM_PHASE_MS) {
-    // Phase 1: no node nearby
-    lastSignalMs = now - (VIBE_TIMEOUT_MS + 1000);
-  } else if (t < SIM_PHASE_MS * 2) {
-    // Phase 2: getting closer (far -> close)
-    uint32_t p = t - SIM_PHASE_MS;
-    float frac = (float)p / (float)SIM_PHASE_MS;
-    int step = (int)round(19.0f * (1.0f - frac));
-    if (step < 0) step = 0;
-    if (step > 19) step = 19;
-    lastStep = applyDistanceScale(step);
-    lastSignalMs = now;
+  enum SimPhase : uint8_t { SIM_NONE_HOLD = 0, SIM_RAMP_IN = 1, SIM_INNER_HOLD = 2, SIM_RAMP_OUT = 3 };
+  static uint8_t lastPhase = 255;
+
+  SimPhase phase = SIM_NONE_HOLD;
+  uint32_t phaseT = t;
+
+  if (t < SIM_HOLD_OUTER_MS) {
+    phase = SIM_NONE_HOLD;
+    phaseT = t;
+  } else if (t < SIM_HOLD_OUTER_MS + SIM_RAMP_MS) {
+    phase = SIM_RAMP_IN;
+    phaseT = t - SIM_HOLD_OUTER_MS;
+  } else if (t < SIM_HOLD_OUTER_MS + SIM_RAMP_MS + SIM_HOLD_INNER_MS) {
+    phase = SIM_INNER_HOLD;
+    phaseT = t - (SIM_HOLD_OUTER_MS + SIM_RAMP_MS);
   } else {
-    // Phase 3: getting farther (close -> far)
-    uint32_t p = t - (SIM_PHASE_MS * 2);
-    float frac = (float)p / (float)SIM_PHASE_MS;
-    int step = (int)round(19.0f * frac);
-    if (step < 0) step = 0;
-    if (step > 19) step = 19;
-    lastStep = applyDistanceScale(step);
-    lastSignalMs = now;
+    phase = SIM_RAMP_OUT;
+    phaseT = t - (SIM_HOLD_OUTER_MS + SIM_RAMP_MS + SIM_HOLD_INNER_MS);
   }
+
+  if ((uint8_t)phase != lastPhase) {
+    lastPhase = (uint8_t)phase;
+    if (phase == SIM_NONE_HOLD) {
+      // Entering "None" state: clear averager and reset to far window.
+      resetRssiAverager();
+      currentHapticWindow = WIN_VERY_FAR;
+      lastWindowDistanceFt = SIM_FAR_FT;
+      hapticTransitionReq.pending = false;
+      lastStep = 19;
+      smoothedDistanceFt = SIM_FAR_FT;
+    }
+  }
+
+  if (phase == SIM_NONE_HOLD) {
+    // No node nearby: suppress signal so vibration stops.
+    lastSignalMs = now - (VIBE_TIMEOUT_MS + 1000);
+    return;
+  }
+
+  float distFt = SIM_FAR_FT;
+  if (phase == SIM_RAMP_IN) {
+    float frac = (float)phaseT / (float)SIM_RAMP_MS;
+    distFt = lerpFloat(SIM_FAR_FT, SIM_NEAR_FT, clamp01(frac));
+  } else if (phase == SIM_INNER_HOLD) {
+    distFt = SIM_NEAR_FT;
+  } else { // SIM_RAMP_OUT
+    float frac = (float)phaseT / (float)SIM_RAMP_MS;
+    distFt = lerpFloat(SIM_NEAR_FT, SIM_FAR_FT, clamp01(frac));
+  }
+
+  if (distFt < 0.1f) distFt = 0.1f;
+  // Provide a synthetic RSSI history so windowing can be tested in sim mode.
+  int16_t pseudoRssi = estimateRssiFromDistanceFeet(distFt);
+  lastRssi = pseudoRssi;
+  smoothedRssi = (float)pseudoRssi;
+  // Step is still used for the on-screen "distance" display and pulse smoothing.
+  lastStep = estimateDistanceStep(pseudoRssi);
+  lastSignalMs = now;
+
+  smoothedDistanceFt = DIST_SMOOTH_ALPHA * distFt + (1.0f - DIST_SMOOTH_ALPHA) * smoothedDistanceFt;
+  recordRssiSample(pseudoRssi, now);
+  updateHapticWindowFromAvgRssi(now);
 }
 
 String buildPing() {
@@ -856,15 +1198,8 @@ uint8_t motorIntensityForStep(int step) {
 }
 
 uint8_t motorIntensityWithMode(int step) {
-  uint8_t intensity = motorIntensityForStep(step);
-  // Apply user-selected intensity scaling
-  switch (intensityMode) {
-    case 0: intensity = (uint8_t)round(intensity * 0.40f); break; // soft
-    case 1: intensity = (uint8_t)round(intensity * 0.65f); break; // medium
-    case 2: intensity = (uint8_t)round(intensity * 0.85f); break; // hard
-    case 3: default: /* max */ break;
-  }
-  if (intensity < 10) intensity = 10;
+  // Windowed scaling (resets within each distance window)
+  uint8_t intensity = motorIntensityForStepWindowed(step);
   if (intensity > 127) intensity = 127;
   return intensity;
 }
@@ -879,29 +1214,21 @@ void motorPulseForStep(int step) {
 }
 
 uint32_t vibrationIntervalForStep(int step) {
-  // Closer -> faster pulses
-  // step 0 => 120ms, step 19 => 800ms
-  const uint32_t minMs = 120;
-  const uint32_t maxMs = 800;
-  float t = (float)step / 19.0f;
-  uint32_t interval = (uint32_t)round(minMs + (maxMs - minMs) * t);
-  if (interval < minMs) interval = minMs;
-  if (interval > maxMs) interval = maxMs;
-  return interval;
+  return vibrationIntervalForStepWindowed(step);
 }
 
 float vibrationOnRatioForStep(int step) {
-  // Closer -> longer on time
-  // step 0 => 0.80, step 19 => 0.30
-  float t = (float)step / 19.0f;
-  float ratio = 0.80f - 0.50f * t;
-  if (ratio < 0.30f) ratio = 0.30f;
-  if (ratio > 0.80f) ratio = 0.80f;
-  return ratio;
+  return vibrationOnRatioForStepWindowed(step);
 }
 
 void vibrationTask(void* parameter) {
   const TickType_t delayTicks = pdMS_TO_TICKS(10);
+  bool transitionActive = false;
+  uint32_t transitionStartMs = 0;
+  uint32_t transitionEndMs = 0;
+  uint8_t transitionFrom = 0;
+  uint8_t transitionTo = 0;
+  uint8_t transitionPattern = 0; // 0 = up, 1 = down
   for (;;) {
     if (drvOk) {
       uint32_t now = millis();
@@ -946,6 +1273,93 @@ void vibrationTask(void* parameter) {
           continue;
         }
         hapticPreviewUntilMs = 0;
+      }
+
+      // Window transition cue overrides normal vibration briefly.
+      if (transitionActive) {
+        if (now >= transitionEndMs) {
+          drv.setRealtimeValue(0);
+          vibeOn = false;
+          transitionActive = false;
+          nextVibeToggleMs = now + 20;
+        } else {
+          uint32_t elapsed = now - transitionStartMs;
+          uint32_t dur = transitionEndMs - transitionStartMs;
+          float t = (dur <= 1) ? 1.0f : (float)elapsed / (float)dur;
+          t = clamp01(t);
+
+          // Signature patterns:
+          // - UP: 3 ascending chirps, then pulsed ramp-up (increasing frequency/duty)
+          // - DOWN: 1 strong buzz, then sparse pulsed fade (decreasing frequency/duty)
+          uint8_t intensity = 0;
+
+          if (transitionPattern == 0) {
+            // Ramp-up "chirps" in first ~300ms
+            if (elapsed < 320) {
+              // 3 x (on 60ms, off 40ms)
+              uint32_t slot = elapsed / 100;
+              uint32_t inSlot = elapsed % 100;
+              bool on = (inSlot < 60) && (slot < 3);
+              if (on) {
+                float p = (slot + 1) / 3.0f; // 0.33, 0.66, 1.0
+                intensity = (uint8_t)round(lerpFloat(10.0f, (float)transitionTo, p * 0.65f));
+              } else {
+                intensity = 0;
+              }
+            } else {
+              // After chirps: ease-in ramp with pulsed duty cycle
+              float tt = (t - 0.20f) / 0.80f;
+              tt = clamp01(tt);
+              float ease = tt * tt * tt; // cubic ease-in
+              uint8_t base = lerpU8(transitionFrom, transitionTo, ease);
+
+              float freqHz = lerpFloat(8.0f, 18.0f, tt);     // faster as it ramps
+              float duty = lerpFloat(0.25f, 0.60f, tt);      // more "present" as it ramps
+              float timeSec = (float)elapsed / 1000.0f;
+              float cycle = fmodf(timeSec * freqHz, 1.0f);
+              bool gateOn = (cycle < duty);
+              intensity = gateOn ? base : 0;
+            }
+          } else {
+            // Ramp-down: strong buzz then sparse fade
+            if (elapsed < 220) {
+              // strong buzz start: 140ms on, 80ms off
+              intensity = (elapsed < 140) ? transitionFrom : 0;
+            } else {
+              float ease = 1.0f - (1.0f - t) * (1.0f - t); // ease-out for the drop
+              uint8_t base = lerpU8(transitionFrom, transitionTo, ease);
+
+              float freqHz = lerpFloat(16.0f, 6.0f, t);    // slows down as it fades
+              float duty = lerpFloat(0.35f, 0.12f, t);      // gets sparser
+              float timeSec = (float)elapsed / 1000.0f;
+              float cycle = fmodf(timeSec * freqHz, 1.0f);
+              bool gateOn = (cycle < duty);
+              intensity = gateOn ? base : 0;
+            }
+          }
+
+          drv.setRealtimeValue(intensity);
+          vibeOn = (intensity != 0);
+        }
+        vTaskDelay(delayTicks);
+        continue;
+      }
+
+      if (hapticTransitionReq.pending) {
+        // Latch request to local state and clear pending quickly.
+        transitionFrom = hapticTransitionReq.fromIntensity;
+        transitionTo = hapticTransitionReq.toIntensity;
+        transitionPattern = hapticTransitionReq.pattern;
+        uint16_t dur = hapticTransitionReq.durationMs;
+        hapticTransitionReq.pending = false;
+        transitionStartMs = now;
+        transitionEndMs = now + (dur == 0 ? 1 : dur);
+        transitionActive = true;
+        // Cancel any scheduled pulsing edge so the transition is crisp.
+        nextVibeToggleMs = now;
+        motorStopMs = 0;
+        vTaskDelay(delayTicks);
+        continue;
       }
 
       // Vibration rate control: only vibrate if we received recently
@@ -1154,6 +1568,8 @@ void loop() {
 
       // Smooth RSSI to reduce jitter
       smoothedRssi = RSSI_SMOOTH_ALPHA * lastRssi + (1.0f - RSSI_SMOOTH_ALPHA) * smoothedRssi;
+      float distFt = estimateDistanceFeetFromRssi((int16_t)round(smoothedRssi));
+      smoothedDistanceFt = DIST_SMOOTH_ALPHA * distFt + (1.0f - DIST_SMOOTH_ALPHA) * smoothedDistanceFt;
       int step = estimateDistanceStep((int16_t)round(smoothedRssi));
       rxCounter++;
       if (rxCounter % rxLogEvery == 0) {
@@ -1170,6 +1586,8 @@ void loop() {
 
       // Track latest step for vibration rate control
       lastStep = step;
+      recordRssiSample(lastRssi, lastRxMs);
+      updateHapticWindowFromAvgRssi(lastRxMs);
 
       // No TFT updates on every RX to reduce jitter
 
@@ -1353,6 +1771,11 @@ void loop() {
       Serial.println("Role: SEARCH");
     }
     lastStep = 19;
+    resetRssiAverager();
+    currentHapticWindow = WIN_VERY_FAR;
+    lastWindowDistanceFt = SIM_FAR_FT;
+    smoothedDistanceFt = SIM_FAR_FT;
+    hapticTransitionReq.pending = false;
     updateDistanceDisplay(lastStep);
   }
 
