@@ -78,6 +78,23 @@ static const uint32_t IDLE_DEEP_SLEEP_MS = 300000;
 static bool powerSaveMode = true;
 ```
 
+### Disable all sleep behaviors (development / always-on)
+
+You can disable *automatic* sleep behaviors (display idle-off + ESP32 light sleep/CAD) while keeping
+manual deep sleep (5s hold) enabled by building with:
+
+```ini
+build_flags =
+  -D HUMN_DISABLE_AUTO_SLEEP=1
+```
+
+If you also want to disable the manual 5-second hold deep sleep:
+
+```ini
+build_flags =
+  -D HUMN_DISABLE_MANUAL_DEEP_SLEEP=1
+```
+
 ### CAD Parameters (in `enterLightSleepWithCAD`):
 
 RadioLib's `startChannelScan()` uses default CAD parameters recommended by Semtech (AN1200.48).

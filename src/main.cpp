@@ -88,12 +88,19 @@ static const uint32_t IDLE_LIGHT_SLEEP_MS = 30000;  // Enter light sleep after t
 static const uint32_t IDLE_DEEP_SLEEP_MS = 300000;  // Enter deep sleep after 5 min idle
 static bool powerSaveMode = true;  // Enable CAD-based power saving
 
-// Temporary development switch: disable all sleep behaviors (display idle off,
-// light sleep/CAD, and deep sleep via long-press).
-#if defined(HUMN_DISABLE_SLEEP) && (HUMN_DISABLE_SLEEP)
-static const bool sleepEnabled = false;
+// Compile-time switches:
+// - Auto sleep controls: display idle-off + ESP32 light sleep/CAD while idle
+// - Manual deep sleep: 5s button hold triggers a true deep sleep reboot
+#if defined(HUMN_DISABLE_AUTO_SLEEP) && (HUMN_DISABLE_AUTO_SLEEP)
+static const bool autoSleepEnabled = false;
 #else
-static const bool sleepEnabled = true;
+static const bool autoSleepEnabled = true;
+#endif
+
+#if defined(HUMN_DISABLE_MANUAL_DEEP_SLEEP) && (HUMN_DISABLE_MANUAL_DEEP_SLEEP)
+static const bool manualDeepSleepEnabled = false;
+#else
+static const bool manualDeepSleepEnabled = true;
 #endif
 
 SPIClass spiLoRa(FSPI);
@@ -579,7 +586,7 @@ void playBootVibration() {
 }
 
 void enterDeepSleep() {
-  if (!sleepEnabled) {
+  if (!manualDeepSleepEnabled) {
     return;
   }
   playBootVibration();
@@ -612,7 +619,7 @@ void enterDeepSleep() {
 
 // Enter light sleep with CAD monitoring for power savings
 void enterLightSleepWithCAD(uint32_t durationMs) {
-  if (!sleepEnabled) {
+  if (!autoSleepEnabled) {
     delay(durationMs);
     return;
   }
@@ -1396,7 +1403,7 @@ void loop() {
 
   // Display idle timeout
   // Don't auto-sleep the display while the button is held.
-  if (sleepEnabled && displayOn && !btnPressed && (millis() - lastUserInteractionMs > DISPLAY_IDLE_MS)) {
+  if (autoSleepEnabled && displayOn && !btnPressed && (millis() - lastUserInteractionMs > DISPLAY_IDLE_MS)) {
     setDisplayOn(false);
     // Light sleep mode begins only when the display times out.
     lightSleepMode = true;
@@ -1410,7 +1417,7 @@ void loop() {
   }
 
   // Power saving: use light sleep with CAD when idle
-  if (sleepEnabled && powerSaveMode && lightSleepMode && !displayOn && deviceOn) {
+  if (autoSleepEnabled && powerSaveMode && lightSleepMode && !displayOn && deviceOn) {
     uint32_t idleTime = millis() - lastUserInteractionMs;
     
     // If we've been idle a while and no recent signal, enter light sleep
