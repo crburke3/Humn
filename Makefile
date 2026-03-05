@@ -1,5 +1,5 @@
-PORT1=/dev/tty.usbmodem21101
-PORT2=/dev/tty.usbmodem21401
+PORT1=/dev/tty.usbmodem101
+PORT2=/dev/tty.usbmodem1101
 ENV=wireless_tracker
 
 .PHONY: upload1 upload2 upload-all monitor1 monitor2 monitor-all upload-monitor1 upload-monitor2 upload-monitor-all kill-monitors

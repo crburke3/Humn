@@ -27,9 +27,11 @@ static const uint32_t DISPLAY_IDLE_MS = 15000;
 // Vext control polarity (some Heltec boards use HIGH to enable)
 static const int VEXT_ACTIVE = HIGH;
 
-// DRV2605L haptic driver (I2C) - fixed pins
-static const int I2C_SDA = 4;
-static const int I2C_SCL = 5;
+// DRV2605L haptic driver (I2C) - try primary first, then alternate if pins 4/5 are damaged
+static const int I2C_SDA_PRIMARY   = 4;
+static const int I2C_SCL_PRIMARY   = 5;
+static const int I2C_SDA_ALTERNATE = 16;
+static const int I2C_SCL_ALTERNATE = 17;
 static const uint16_t MOTOR_PULSE_MS = 200;
 static const int GNSS_RST_PIN = 35; // GPIO35 = GNSS_RST
 
@@ -38,7 +40,7 @@ static const int USER_BTN_PIN = 0;
 static const bool USER_BTN_ACTIVE_LOW = true;
 static const uint32_t BTN_DEBOUNCE_MS = 200;
 static const uint32_t BTN_HOLD_MS = 700;
-static const uint32_t BTN_POWER_HOLD_MS = 3000;
+static const uint32_t BTN_POWER_HOLD_MS = 5000;
 static const int ADC_BAT_PIN = 1;   // GPIO1 = Vbat_Read
 static const int ADC_CTRL_PIN = 2;  // GPIO2 = ADC_Ctrl
 static const float VBAT_DIVIDER = 4.9f;
@@ -164,19 +166,18 @@ void saveSettings() {
 
 void loadSettings() {
   intensityMode = prefs.getUChar("intensity", 1);
-  pingRateIndex = prefs.getUChar("pingIdx", 6);
+  // Ping fixed at 50ms (setting temporarily disabled)
+  pingRateIndex = 7;  // 50ms in PING_RATES_MS
+  pingBaseMs = 50;
+  pingJitterMs = max<uint32_t>(10, pingBaseMs / 4);
+
   feedbackMode = (FeedbackMode)prefs.getUChar("feedback", (uint8_t)FEEDBACK_PULSED_RATE);
   uiSetting = prefs.getUChar("ui", (uint8_t)UI_VIBE);
+  if (uiSetting == UI_PING) uiSetting = UI_VIBE;  // Ping hidden; fixed at 50ms
   simulateDistance = prefs.getBool("sim", false);
   distanceScaleIndex = prefs.getUChar("scale", 10);
   if (distanceScaleIndex < 10) distanceScaleIndex = 10;
   if (distanceScaleIndex > 30) distanceScaleIndex = 30;
-
-  if (pingRateIndex >= (sizeof(PING_RATES_MS) / sizeof(PING_RATES_MS[0]))) {
-    pingRateIndex = 0;
-  }
-  pingBaseMs = PING_RATES_MS[pingRateIndex];
-  pingJitterMs = max<uint32_t>(10, pingBaseMs / 4);
 }
 static const uint32_t VIBE_TIMEOUT_MS = 3000;
 static uint32_t nextVibeToggleMs = 0;
@@ -715,26 +716,6 @@ void enterLightSleepWithCAD(uint32_t durationMs) {
   }
 }
 
-void requireWakeHoldIfNeeded() {
-  if (!sleepEnabled) {
-    return;
-  }
-  if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_EXT0) {
-    return;
-  }
-  pinMode(USER_BTN_PIN, INPUT_PULLUP);
-  uint32_t startMs = millis();
-  while (digitalRead(USER_BTN_PIN) == (USER_BTN_ACTIVE_LOW ? LOW : HIGH)) {
-    if (millis() - startMs >= BTN_POWER_HOLD_MS) {
-      return;
-    }
-    delay(10);
-  }
-
-  esp_sleep_enable_ext0_wakeup((gpio_num_t)USER_BTN_PIN, USER_BTN_ACTIVE_LOW ? 0 : 1);
-  esp_deep_sleep_start();
-}
-
 void refreshDisplay() {
   tft.fillScreen(ST77XX_BLACK);
   tft.setTextWrap(false);
@@ -1008,13 +989,10 @@ void setup() {
   // Reduce ESP-IDF/Arduino core log noise (prevents USB-serial ISR overload -> INT_WDT).
   esp_log_level_set("*", ESP_LOG_ERROR);
 
-  // Require a 3s hold to exit deep sleep
-  requireWakeHoldIfNeeded();
   const esp_sleep_wakeup_cause_t wakeCause = esp_sleep_get_wakeup_cause();
   const esp_reset_reason_t resetReason = esp_reset_reason();
-  const bool wokeFromDeepSleep = (wakeCause == ESP_SLEEP_WAKEUP_EXT0);
   const bool coldBoot = (resetReason == ESP_RST_POWERON);
-  const bool showBootAnim = (coldBoot || wokeFromDeepSleep);
+  const bool showBootAnim = coldBoot;
 
   // Seed RNG for ping jitter
   randomSeed((uint32_t)ESP.getEfuseMac());
@@ -1084,22 +1062,34 @@ void setup() {
   lora.setDio1Action(setLoraFlag);
   lora.startReceive();
 
-  // Setup DRV2605L (I2C) - fixed SDA/SCL pins
-  Wire.begin(I2C_SDA, I2C_SCL);
-  drvOk = drv.begin();
-
-  if (drvOk) {
-    drv.selectLibrary(1);
-    drv.setMode(DRV2605_MODE_REALTIME);
-    drv.setRealtimeValue(0);
-    Serial.println("DRV2605L init OK.");
-    Serial.print("DRV2605L I2C pins: SDA=");
-    Serial.print(I2C_SDA);
-    Serial.print(" SCL=");
-    Serial.println(I2C_SCL);
-    Serial.println("Button cycles intensity: soft/medium/hard/max");
-  } else {
-    Serial.println("DRV2605L init FAILED.");
+  // Setup DRV2605L (I2C) - try primary bus (4/5), then alternate (16/17) if needed
+  struct { int sda; int scl; } i2cBuses[] = {
+    { I2C_SDA_PRIMARY,   I2C_SCL_PRIMARY   },
+    { I2C_SDA_ALTERNATE, I2C_SCL_ALTERNATE }
+  };
+  for (size_t b = 0; b < sizeof(i2cBuses) / sizeof(i2cBuses[0]) && !drvOk; b++) {
+    Wire.end();
+    Wire.begin(i2cBuses[b].sda, i2cBuses[b].scl);
+    drvOk = drv.begin();
+    if (drvOk) {
+      drv.selectLibrary(1);
+      drv.setMode(DRV2605_MODE_REALTIME);
+      drv.setRealtimeValue(0);
+      Serial.println("DRV2605L init OK.");
+      Serial.print("DRV2605L I2C pins: SDA=");
+      Serial.print(i2cBuses[b].sda);
+      Serial.print(" SCL=");
+      Serial.println(i2cBuses[b].scl);
+      Serial.println("Button cycles intensity: soft/medium/hard/max");
+    } else {
+      Serial.print("DRV2605L not found on SDA=");
+      Serial.print(i2cBuses[b].sda);
+      Serial.print(" SCL=");
+      Serial.println(i2cBuses[b].scl);
+    }
+  }
+  if (!drvOk) {
+    Serial.println("DRV2605L init FAILED on both I2C buses.");
     Serial.println("Check wiring + power. DRV2605L addr is 0x5A or 0x5B.");
   }
 
@@ -1229,9 +1219,11 @@ void loop() {
       btnPressStartMs = 0;
       enterDeepSleep();
     } else if (deviceOn && displayOn && heldMs >= BTN_HOLD_MS && !btnHoldHandled) {
-      // Long-press: cycle which setting is being edited
+      // Long-press: cycle which setting is being edited (skip ping — fixed at 50ms)
       btnHoldHandled = true;
-      uiSetting = (uiSetting + 1) % 5;
+      do {
+        uiSetting = (uiSetting + 1) % 5;
+      } while (uiSetting == UI_PING);
 
       if (verboseUiLogs && Serial) {
         Serial.print("Edit setting: ");
@@ -1273,16 +1265,8 @@ void loop() {
         updateIntensityDisplay();
         saveSettings();
       } else if (uiSetting == UI_PING) {
-        pingRateIndex = (pingRateIndex + 1) % (sizeof(PING_RATES_MS) / sizeof(PING_RATES_MS[0]));
-        pingBaseMs = PING_RATES_MS[pingRateIndex];
-        pingJitterMs = max<uint32_t>(10, pingBaseMs / 4);
-        if (verboseUiLogs && Serial) {
-          Serial.print("Ping rate: ");
-          Serial.print(pingBaseMs);
-          Serial.println(" ms");
-        }
+        // Ping setting temporarily disabled — fixed at 50ms (no-op)
         updatePingRateDisplay();
-        saveSettings();
       } else if (uiSetting == UI_FEEDBACK) {
         feedbackMode = (FeedbackMode)((feedbackMode + 1) % 3);
         if (verboseUiLogs && Serial) {
