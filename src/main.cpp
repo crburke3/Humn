@@ -309,11 +309,6 @@ void updateIntensityDisplay() {
 
 void updatePingRateDisplay() {
   tft.fillRect(0, 12, 160, 12, ST77XX_BLACK);
-  tft.setTextSize(1);
-  tft.setCursor(0, 12);
-  tft.print("Ping: ");
-  tft.print(pingBaseMs);
-  tft.print("ms");
 }
 
 void updateFeedbackDisplay() {
@@ -336,7 +331,6 @@ void updateUiSelectionDisplay() {
   tft.setCursor(0, 72);
   tft.print("Edit: ");
   if (uiSetting == UI_VIBE) tft.print("vibe");
-  else if (uiSetting == UI_PING) tft.print("ping");
   else if (uiSetting == UI_FEEDBACK) tft.print("feedback");
   else if (uiSetting == UI_SIM) tft.print("sim");
   else tft.print("scale");
@@ -976,16 +970,29 @@ void vibrationTask(void* parameter) {
 }
 
 void setup() {
+  // Bring up the display ASAP so the HUMN logo appears immediately on boot.
+  // Keep backlight off while drawing to avoid a "flash" of uninitialized pixels.
+  pinMode(VEXT_CTRL, OUTPUT);
+  digitalWrite(VEXT_CTRL, VEXT_ACTIVE);  // Powers TFT + GNSS rail
+  pinMode(TFT_LED_K, OUTPUT);
+  digitalWrite(TFT_LED_K, LOW);          // Backlight off while initializing
+  delay(50);
+
+  tft.initR(INITR_MINI160x80_PLUGIN);
+  tft.setRotation(1);
+  tft.fillScreen(ST77XX_BLACK);
+  showHumnLogo();
+  digitalWrite(TFT_LED_K, HIGH);         // Backlight on once logo is drawn
+  displayOn = true;
+  lightSleepMode = false;
+  lastUserInteractionMs = millis();
+
   // Initialize Serial - using USB CDC on ESP32-S3
   Serial.begin(115200);
   Serial.setDebugOutput(false);
-  
-  // Wait for USB CDC to be ready
-  while(!Serial && millis() < 5000) {
+  while (!Serial && millis() < 5000) {
     delay(10);
   }
-  
-  // Short delay for serial monitor connection
   delay(300);
 
   Serial.println("\n\n========================================");
@@ -996,10 +1003,8 @@ void setup() {
   // Reduce ESP-IDF/Arduino core log noise (prevents USB-serial ISR overload -> INT_WDT).
   esp_log_level_set("*", ESP_LOG_ERROR);
 
-  const esp_sleep_wakeup_cause_t wakeCause = esp_sleep_get_wakeup_cause();
   const esp_reset_reason_t resetReason = esp_reset_reason();
   const bool coldBoot = (resetReason == ESP_RST_POWERON);
-  const bool showBootAnim = coldBoot;
 
   // Seed RNG for ping jitter
   randomSeed((uint32_t)ESP.getEfuseMac());
@@ -1011,21 +1016,9 @@ void setup() {
   prefs.begin("humn", false);
   loadSettings();
 
-  // Enable Vext (powers TFT + GNSS)
-  pinMode(VEXT_CTRL, OUTPUT);
-  digitalWrite(VEXT_CTRL, VEXT_ACTIVE);
-  delay(100);
-
   // Hold GNSS in reset (we don't use it)
   pinMode(GNSS_RST_PIN, OUTPUT);
   digitalWrite(GNSS_RST_PIN, LOW);
-
-  // Enable TFT backlight (polarity may vary by board)
-  pinMode(TFT_LED_K, OUTPUT);
-  digitalWrite(TFT_LED_K, LOW);
-  displayOn = false;
-  lastUserInteractionMs = millis();
-  delay(50);
 
   // Setup user button
   pinMode(USER_BTN_PIN, INPUT_PULLUP);
@@ -1039,13 +1032,6 @@ void setup() {
   // Setup status LED
   pinMode(STATUS_LED_PIN, OUTPUT);
   digitalWrite(STATUS_LED_PIN, LOW);
-
-  // Initialize TFT
-  tft.initR(INITR_MINI160x80_PLUGIN);
-  tft.setRotation(1);
-  tft.fillScreen(ST77XX_BLACK);
-
-  Serial.println("TFT init complete.");
 
   // Initialize LoRa radio
   spiLoRa.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
@@ -1100,12 +1086,9 @@ void setup() {
     Serial.println("Check wiring + power. DRV2605L addr is 0x5A or 0x5B.");
   }
 
-  // Draw boot logo + vibration
-  uiSetting = UI_VIBE;
-  updateUiSelectionDisplay();
-  setDisplayOn(true, false);
-  if (showBootAnim) {
-    showHumnLogo();
+  // Boot vibration (cold boot only). Deep sleep wake is a reboot too, but keep
+  // the haptic quieter unless it's a true power-on.
+  if (coldBoot) {
     playBootVibration();
     delay(500);
   }
@@ -1235,7 +1218,6 @@ void loop() {
       if (verboseUiLogs && Serial) {
         Serial.print("Edit setting: ");
         if (uiSetting == UI_VIBE) Serial.println("vibe");
-        else if (uiSetting == UI_PING) Serial.println("ping");
         else if (uiSetting == UI_FEEDBACK) Serial.println("feedback");
         else if (uiSetting == UI_SIM) Serial.println("sim");
         else Serial.println("scale");
@@ -1271,9 +1253,6 @@ void loop() {
         }
         updateIntensityDisplay();
         saveSettings();
-      } else if (uiSetting == UI_PING) {
-        // Ping setting temporarily disabled — fixed at 50ms (no-op)
-        updatePingRateDisplay();
       } else if (uiSetting == UI_FEEDBACK) {
         feedbackMode = (FeedbackMode)((feedbackMode + 1) % 3);
         if (verboseUiLogs && Serial) {
