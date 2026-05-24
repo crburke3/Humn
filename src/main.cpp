@@ -4,47 +4,32 @@
 #include <Preferences.h>
 #include <Adafruit_DRV2605.h>
 #include <RadioLib.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_ST7735.h>
 #include <esp_sleep.h>
 #include <esp_system.h>
 #include <esp_log.h>
-#include <WiFi.h>
 #include <math.h>
 
-// Heltec Wireless Tracker V1.1 TFT pins (from datasheet)
-// TFT: ST7735 160x80, SPI interface
-static const int TFT_CS   = 38;
-static const int TFT_RST  = 39;
-static const int TFT_DC   = 40;  // TFT_RS
-static const int TFT_SCLK = 41;  // TFT_SCLK
-static const int TFT_MOSI = 42;  // TFT_SDIN
-
-// Power control
-static const int VEXT_CTRL = 3;  // Vext Ctrl (powers TFT + GNSS)
-static const int TFT_LED_K = 21; // Backlight cathode control
+// Humn custom PCB: ESP32-C6-WROOM-1-N8 + SX1262 + DRV2605L.
+// There is no TFT/display rail on this board; status goes to USB serial.
 static const uint32_t DISPLAY_IDLE_MS = 15000;
 
-// Vext control polarity (some Heltec boards use HIGH to enable)
-static const int VEXT_ACTIVE = HIGH;
-
-// DRV2605L haptic driver (I2C) - try primary first, then alternate if pins 4/5 are damaged
-static const int I2C_SDA_PRIMARY   = 4;
-static const int I2C_SCL_PRIMARY   = 5;
-static const int I2C_SDA_ALTERNATE = 16;
-static const int I2C_SCL_ALTERNATE = 17;
+// DRV2605L haptic driver.
+static const int I2C_SDA_PIN = 21;
+static const int I2C_SCL_PIN = 22;
+static const int HAPTIC_EN_PIN = 23;
+static const int HAPTIC_TRIG_PIN = 15;
 static const uint16_t MOTOR_PULSE_MS = 200;
-static const int GNSS_RST_PIN = 35; // GPIO35 = GNSS_RST
 
-// User button (GPIO0) cycles vibration intensity
-static const int USER_BTN_PIN = 0;
+// SW_BOOT is GPIO9 on ESP32-C6. It can be used as a user button after boot,
+// but holding it while resetting will enter the ROM bootloader.
+static const int USER_BTN_PIN = 9;
 static const bool USER_BTN_ACTIVE_LOW = true;
 static const uint32_t BTN_DEBOUNCE_MS = 200;
 static const uint32_t BTN_HOLD_MS = 700;
 static const uint32_t BTN_POWER_HOLD_MS = 5000;
-static const int ADC_BAT_PIN = 1;   // GPIO1 = Vbat_Read
-static const int ADC_CTRL_PIN = 2;  // GPIO2 = ADC_Ctrl
-static const float VBAT_DIVIDER = 4.9f;
+static const int MODE_SWITCH_ADC_PIN = 3;
+static const int ADC_BAT_PIN = 2;
+static const float VBAT_DIVIDER = 2.0f;
 
 enum UiSetting : uint8_t {
   UI_VIBE = 0,
@@ -57,24 +42,27 @@ enum UiSetting : uint8_t {
 void updateBatteryDisplay(bool force = false);
 void setDisplayOn(bool on, bool refresh = true);
 int estimateDistanceStep(int16_t rssiDbm);
+void configureLoRaRadio();
+void recoverLoRaRadio(const char* reason, int state);
+void applyModeSwitchScale(bool force = false);
 
 // Status LED
-static const int STATUS_LED_PIN = 18;
+static const int STATUS_LED_PIN = -1;
 static const bool LED_ENABLED = false;
 static const uint32_t LED_PULSE_MS = 40;
 
-// Use explicit MOSI/SCLK pins as in known working examples
-Adafruit_ST7735 tft(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK, TFT_RST);
 Adafruit_DRV2605 drv;
 
-// LoRa pins (Heltec Wireless Tracker V1.x)
-static const int LORA_NSS  = 8;
-static const int LORA_SCK  = 9;
+// LoRa pins from the Humn schematic.
+static const int LORA_NSS  = 7;
+static const int LORA_SCK  = 1;
 static const int LORA_MOSI = 10;
-static const int LORA_MISO = 11;
-static const int LORA_RST  = 12;
-static const int LORA_BUSY = 13;
-static const int LORA_DIO1 = 14;
+static const int LORA_MISO = 8;
+static const int LORA_RST  = 5;
+static const int LORA_BUSY = 4;
+static const int LORA_DIO1 = 6;
+static const int LORA_DIO2 = 18;
+static const int LORA_DIO3 = 19;
 
 // LoRa settings (US915 defaults)
 static const float LORA_FREQ_MHZ = 915.0;
@@ -82,7 +70,7 @@ static const float LORA_BW_KHZ = 500.0;
 static const uint8_t LORA_SF = 6;
 static const uint8_t LORA_CR = 5;
 static const uint8_t LORA_SYNC_WORD = 0x12;
-static const int8_t LORA_TX_POWER = 22;
+static const int8_t LORA_TX_POWER = 10;
 
 // Power saving with CAD (Channel Activity Detection)
 static const uint32_t CAD_CHECK_INTERVAL_MS = 100;  // How often to check for signals in light sleep
@@ -116,7 +104,7 @@ static uint32_t nextPingMs = 0;
 static uint32_t pingCounter = 0;
 static uint32_t lastPingSentMs = 0;
 static uint32_t pingIntervalLogEvery = 10;
-static uint32_t rxLogEvery = 10;
+static uint32_t rxLogEvery = 5;
 static uint32_t rxCounter = 0;
 static int16_t lastRssi = 0;
 static float lastSnr = 0.0f;
@@ -142,8 +130,8 @@ static uint32_t lastRxMs = 0;
 static uint32_t lastSignalMs = 0;
 static const uint32_t PING_RATES_MS[] = {1000, 800, 600, 400, 300, 200, 100, 50};
 static uint8_t pingRateIndex = 0;
-static uint32_t pingBaseMs = 100;
-static uint32_t pingJitterMs = 100;
+static uint32_t pingBaseMs = 700;
+static uint32_t pingJitterMs = 175;
 static const uint32_t PING_LATE_WARN_MS = 50;
 static uint32_t lastPingLateLogMs = 0;
 static const uint32_t PING_LATE_LOG_THROTTLE_MS = 2000;
@@ -154,7 +142,7 @@ static bool verboseTimingLogs = false;
 static bool verboseUiLogs = false;
 
 static const uint32_t TX_WARN_MS = 80;
-static const uint32_t PEER_TIMEOUT_MS = 3000;
+static const uint32_t PEER_TIMEOUT_MS = 5000;
 
 enum Role : uint8_t { ROLE_SEARCH = 0, ROLE_PINGER = 1, ROLE_RESPONDER = 2 };
 static Role role = ROLE_SEARCH;
@@ -163,31 +151,47 @@ static uint32_t peerId = 0;
 static uint32_t lastPeerSeenMs = 0;
 static Preferences prefs;
 static bool simulateDistance = false;
+static const bool SIMULATION_MODE_ENABLED = false;
 static uint8_t distanceScaleIndex = 10; // 10 = 1.0x
+static uint8_t lastModeSwitchBucket = 255;
+static int lastModeSwitchStableValue = 0;
+static int lastModeSwitchLoggedValue = -10000;
+static uint8_t pendingModeSwitchBucket = 255;
+static uint8_t pendingModeSwitchCount = 0;
+static int pendingModeSwitchValue = 0;
+static uint32_t lastModeSwitchReadMs = 0;
+static uint32_t lastInvalidModeSwitchLogMs = 0;
+static const uint32_t MODE_SWITCH_READ_MS = 75;
+static const uint8_t MODE_SWITCH_STABLE_READS = 2;
+static const bool MODE_SWITCH_ANALOG_ENABLED = true;
+static const uint8_t MODE_SWITCH_INVALID_BUCKET = 255;
 
 void saveSettings() {
   prefs.putUChar("intensity", intensityMode);
   prefs.putUChar("pingIdx", pingRateIndex);
   prefs.putUChar("feedback", (uint8_t)feedbackMode);
   prefs.putUChar("ui", uiSetting);
-  prefs.putBool("sim", simulateDistance);
-  prefs.putUChar("scale", distanceScaleIndex);
+  if (SIMULATION_MODE_ENABLED) {
+    prefs.putBool("sim", simulateDistance);
+  }
 }
 
 void loadSettings() {
-  intensityMode = prefs.getUChar("intensity", 1);
-  // Ping fixed at 50ms (setting temporarily disabled)
-  pingRateIndex = 7;  // 50ms in PING_RATES_MS
-  pingBaseMs = 50;
-  pingJitterMs = max<uint32_t>(10, pingBaseMs / 4);
+  intensityMode = 3;
+  // Beacon at a modest rate for the custom board. Both peers transmit their ID,
+  // and distance is estimated from any received beacon.
+  pingRateIndex = 4;
+  pingBaseMs = 700;
+  pingJitterMs = max<uint32_t>(25, pingBaseMs / 4);
 
-  feedbackMode = (FeedbackMode)prefs.getUChar("feedback", (uint8_t)FEEDBACK_PULSED_RATE);
+  feedbackMode = FEEDBACK_PULSED_RATE;
   uiSetting = prefs.getUChar("ui", (uint8_t)UI_VIBE);
-  if (uiSetting == UI_PING) uiSetting = UI_VIBE;  // Ping hidden; fixed at 50ms
-  simulateDistance = prefs.getBool("sim", false);
-  distanceScaleIndex = prefs.getUChar("scale", 10);
-  if (distanceScaleIndex < 10) distanceScaleIndex = 10;
-  if (distanceScaleIndex > 30) distanceScaleIndex = 30;
+  if (uiSetting == UI_PING || uiSetting == UI_SCALE ||
+      (!SIMULATION_MODE_ENABLED && uiSetting == UI_SIM)) {
+    uiSetting = UI_VIBE;
+  }
+  simulateDistance = SIMULATION_MODE_ENABLED ? prefs.getBool("sim", false) : false;
+  distanceScaleIndex = 10;
 }
 static const uint32_t VIBE_TIMEOUT_MS = 3000;
 static uint32_t nextVibeToggleMs = 0;
@@ -287,7 +291,7 @@ struct HapticTransitionRequest {
   volatile bool pending;
   volatile uint8_t fromIntensity;
   volatile uint8_t toIntensity;
-  volatile uint8_t pattern; // 0 = up, 1 = down
+  volatile uint8_t pattern; // 0 = distance up, 1 = distance down, 2 = scale change
   volatile uint16_t durationMs;
 };
 static HapticTransitionRequest hapticTransitionReq = { false, 0, 0, 0, 1400 };
@@ -485,14 +489,11 @@ static uint32_t lastUserInteractionMs = 0;
 static bool deviceOn = true;
 static uint32_t lastBatteryReadMs = 0;
 static int lastBatteryPct = -1;
+static float lastBatteryVoltage = 0.0f;
 
 void enterDeepSleep();
 void playBootVibration();
 void requireWakeHoldIfNeeded();
-static const uint16_t HUMN_LOGO_W = 120;
-static const uint16_t HUMN_LOGO_H = 40;
-static uint8_t humnLogoBitmap[HUMN_LOGO_W * HUMN_LOGO_H / 8];
-static bool humnLogoBuilt = false;
 
 
 // Simulation mode: cycles distance without RF (user-toggle)
@@ -577,55 +578,208 @@ const char* intensityLabel(uint8_t mode) {
   }
 }
 
+const char* feedbackLabel() {
+  if (feedbackMode == FEEDBACK_PULSED_RATE) return "pulsed";
+  if (feedbackMode == FEEDBACK_PULSE_ON_RX) return "rx-pulse";
+  return "constant";
+}
+
 void updateIntensityDisplay() {
-  tft.fillRect(0, 0, 160, 12, ST77XX_BLACK);
-  tft.setTextSize(1);
-  tft.setCursor(0, 0);
-  tft.print("Vibe: ");
-  tft.print(intensityLabel(intensityMode));
+  if (Serial) {
+    Serial.print("Vibe: ");
+    Serial.println(intensityLabel(intensityMode));
+  }
   updateBatteryDisplay(true);
 }
 
 void updateFeedbackDisplay() {
-  tft.fillRect(0, 12, 160, 12, ST77XX_BLACK);
-  tft.setTextSize(1);
-  tft.setCursor(0, 12);
-  tft.print("Mode: ");
-  if (feedbackMode == FEEDBACK_PULSED_RATE) {
-    tft.print("pulsed");
-  } else if (feedbackMode == FEEDBACK_PULSE_ON_RX) {
-    tft.print("rx-pulse");
-  } else {
-    tft.print("constant");
+  if (!Serial) {
+    return;
   }
+  Serial.print("Mode: ");
+  Serial.println(feedbackLabel());
 }
 
 void updateUiSelectionDisplay() {
-  tft.fillRect(0, 60, 160, 12, ST77XX_BLACK);
-  tft.setTextSize(1);
-  tft.setCursor(0, 60);
-  tft.print("Edit: ");
-  if (uiSetting == UI_VIBE) tft.print("vibe");
-  else if (uiSetting == UI_FEEDBACK) tft.print("feedback");
-  else if (uiSetting == UI_SIM) tft.print("sim");
-  else tft.print("scale");
+  if (!Serial) {
+    return;
+  }
+  Serial.print("Edit: ");
+  if (uiSetting == UI_VIBE) Serial.println("vibe");
+  else if (uiSetting == UI_FEEDBACK) Serial.println("feedback");
+  else if (uiSetting == UI_SIM) Serial.println("sim");
+  else Serial.println("scale");
 }
 
 void updateSimDisplay() {
-  tft.fillRect(0, 36, 160, 12, ST77XX_BLACK);
-  tft.setTextSize(1);
-  tft.setCursor(0, 36);
-  tft.print("Sim: ");
-  tft.print(simulateDistance ? "on" : "off");
+  if (Serial) {
+    Serial.print("Sim: ");
+    Serial.println(simulateDistance ? "on" : "off");
+  }
 }
 
 void updateScaleDisplay() {
-  tft.fillRect(0, 48, 160, 12, ST77XX_BLACK);
-  tft.setTextSize(1);
-  tft.setCursor(0, 48);
-  tft.print("Scale: ");
-  tft.print(distanceScaleIndex / 10.0f, 1);
-  tft.print("x");
+  if (Serial) {
+    Serial.print("Scale: ");
+    Serial.print(distanceScaleIndex / 10.0f, 1);
+    Serial.println("x");
+  }
+}
+
+const char* modeSwitchReadingUnit() {
+  return MODE_SWITCH_ANALOG_ENABLED ? "mV" : "gpio";
+}
+
+int readModeSwitchDigitalValue() {
+  return digitalRead(MODE_SWITCH_ADC_PIN) == HIGH ? 1 : 0;
+}
+
+int readModeSwitchValue() {
+  if (!MODE_SWITCH_ANALOG_ENABLED) {
+    return readModeSwitchDigitalValue();
+  }
+
+  const int samples = 8;
+  int total = 0;
+  for (int i = 0; i < samples; i++) {
+    total += analogReadMilliVolts(MODE_SWITCH_ADC_PIN);
+    delay(1);
+  }
+  return total / samples;
+}
+
+uint8_t modeSwitchBucketFromResistanceOhms(int ohms) {
+  // Measured on the assembled board at MODE_SWITCH_VAL to GND:
+  // position 0 ~= 10k, position 1 ~= 34k, positions 2/3 ~= 20k.
+  // Positions 2 and 3 are electrically identical from this one sense pin.
+  if (ohms < 15000) return 0;
+  if (ohms < 27000) return 2;
+  return 1;
+}
+
+uint8_t modeSwitchBucketFromMilliVolts(int mv) {
+  // Revision 1 switch salvage mode:
+  // positions 0/1 can short regulator-enable related nets during travel and
+  // are not reliable as live settings. Treat their low-voltage range as invalid
+  // and only use the two stable positions that measure around 2.2V and 3.1V.
+  if (mv < 1850) return MODE_SWITCH_INVALID_BUCKET;
+  if (mv < 2550) return 2;
+  return 1;
+}
+
+uint8_t modeSwitchBucketFromReading(int switchValue) {
+  if (MODE_SWITCH_ANALOG_ENABLED) {
+    return modeSwitchBucketFromMilliVolts(switchValue);
+  }
+  return switchValue ? 1 : 0;
+}
+
+uint8_t scaleIndexForModeSwitchBucket(uint8_t bucket) {
+  static const uint8_t scales[] = { 10, 10, 30 };
+  if (bucket >= sizeof(scales)) {
+    bucket = sizeof(scales) - 1;
+  }
+  return scales[bucket];
+}
+
+void requestScaleChangeHapticCue(uint8_t bucket) {
+  static const uint8_t cueIntensity[] = { 0, 95, 127 };
+  if (bucket >= sizeof(cueIntensity)) {
+    bucket = sizeof(cueIntensity) - 1;
+  }
+
+  hapticTransitionReq.fromIntensity = 0;
+  hapticTransitionReq.toIntensity = cueIntensity[bucket];
+  hapticTransitionReq.pattern = 2;
+  hapticTransitionReq.durationMs = 300;
+  hapticTransitionReq.pending = true;
+
+  if (Serial) {
+    Serial.print("Scale haptic cue requested: bucket=");
+    Serial.print(bucket);
+    Serial.print(" intensity=");
+    Serial.println(cueIntensity[bucket]);
+  }
+}
+
+void printModeSwitchScale(int switchValue, uint8_t bucket, bool boot) {
+  if (!Serial) {
+    return;
+  }
+  Serial.print(boot ? "Mode switch boot: " : "Mode switch changed: ");
+  Serial.print(switchValue);
+  Serial.print(" ");
+  Serial.print(modeSwitchReadingUnit());
+  Serial.print(" bucket=");
+  Serial.print(bucket);
+  Serial.print(" scale=");
+  Serial.print(distanceScaleIndex / 10.0f, 1);
+  Serial.println("x");
+}
+
+void printInvalidModeSwitchValue(int switchValue, bool boot) {
+  if (!Serial) {
+    return;
+  }
+  Serial.print(boot ? "Mode switch boot ignored: " : "Mode switch ignored: ");
+  Serial.print(switchValue);
+  Serial.print(" ");
+  Serial.print(modeSwitchReadingUnit());
+  Serial.println(" invalid Rev1 switch range");
+}
+
+void applyModeSwitchScale(bool force) {
+  int switchValue = readModeSwitchValue();
+  uint8_t bucket = modeSwitchBucketFromReading(switchValue);
+  if (bucket == MODE_SWITCH_INVALID_BUCKET) {
+    uint32_t now = millis();
+    if (force) {
+      printInvalidModeSwitchValue(switchValue, true);
+      return;
+    }
+    if (now - lastInvalidModeSwitchLogMs >= 1000) {
+      printInvalidModeSwitchValue(switchValue, false);
+      lastInvalidModeSwitchLogMs = now;
+    }
+    pendingModeSwitchBucket = MODE_SWITCH_INVALID_BUCKET;
+    pendingModeSwitchCount = 0;
+    return;
+  }
+
+  if (!force && bucket == lastModeSwitchBucket) {
+    if (abs(switchValue - lastModeSwitchLoggedValue) >= 250) {
+      printModeSwitchScale(switchValue, bucket, false);
+      lastModeSwitchLoggedValue = switchValue;
+    }
+    lastModeSwitchStableValue = switchValue;
+    return;
+  }
+
+  if (!force) {
+    if (bucket != pendingModeSwitchBucket) {
+      pendingModeSwitchBucket = bucket;
+      pendingModeSwitchValue = switchValue;
+      pendingModeSwitchCount = 1;
+      return;
+    }
+
+    if (pendingModeSwitchCount < MODE_SWITCH_STABLE_READS) {
+      pendingModeSwitchCount++;
+      return;
+    }
+  }
+
+  pendingModeSwitchBucket = bucket;
+  pendingModeSwitchCount = MODE_SWITCH_STABLE_READS;
+  pendingModeSwitchValue = switchValue;
+  lastModeSwitchBucket = bucket;
+  lastModeSwitchStableValue = pendingModeSwitchValue;
+  distanceScaleIndex = scaleIndexForModeSwitchBucket(bucket);
+  printModeSwitchScale(pendingModeSwitchValue, bucket, force);
+  lastModeSwitchLoggedValue = pendingModeSwitchValue;
+  if (!force) {
+    requestScaleChangeHapticCue(bucket);
+  }
 }
 
 enum DistanceBand : uint8_t {
@@ -661,7 +815,7 @@ DistanceBand distanceBandFromStep(int step) {
 
 void updateDistanceDisplay(int step) {
   // Add hysteresis by only updating when the band changes.
-  // Also refresh periodically so the numeric distance is visible.
+  // Also refresh periodically so serial diagnostics stay useful.
   DistanceBand band = distanceBandFromStep(step);
   uint32_t now = millis();
   bool periodicUpdate = displayOn && (now - lastDistanceNumericUpdateMs >= 1000);
@@ -670,32 +824,58 @@ void updateDistanceDisplay(int step) {
   }
   lastBand = band;
   lastDistanceNumericUpdateMs = now;
-  tft.fillRect(0, 24, 160, 12, ST77XX_BLACK);
-  tft.setTextSize(1);
-  tft.setCursor(0, 24);
-  tft.print("Dist: ");
-  tft.print(distanceCategoryLabel(band));
-
-  // Always append the calculated distance so it's easier to interpret windowing.
-  // Keep it short to fit on the 160px line.
-  float ft = smoothedDistanceFt;
-  tft.print(" ");
-  if (!isfinite(ft) || ft < 0.0f) {
-    tft.print("--");
-  } else {
-    int shownFt = (ft < 100.0f) ? (int)round(ft)
-                 : (ft < 1000.0f) ? (int)round(ft / 10.0f) * 10
-                 : (int)round(ft / 50.0f) * 50;
-    tft.print(shownFt);
-    tft.print("ft");
+  if (!Serial) {
+    return;
   }
+  Serial.print("Dist: ");
+  uint32_t linkAgeMs = (lastSignalMs == 0) ? UINT32_MAX : now - lastSignalMs;
+  if (band == BAND_NONE) {
+    Serial.print("no-signal");
+  } else {
+    Serial.print(distanceCategoryLabel(band));
+
+    float ft = smoothedDistanceFt;
+    Serial.print(" ");
+    if (!isfinite(ft) || ft < 0.0f) {
+      Serial.print("--");
+    } else {
+      int shownFt = (ft < 100.0f) ? (int)round(ft)
+                   : (ft < 1000.0f) ? (int)round(ft / 10.0f) * 10
+                   : (int)round(ft / 50.0f) * 50;
+      Serial.print(shownFt);
+      Serial.print("ft");
+    }
+  }
+  Serial.print(" | rssi=");
+  Serial.print(lastRssi);
+  Serial.print("dBm snr=");
+  Serial.print(lastSnr, 1);
+  Serial.print("dB age=");
+  if (linkAgeMs == UINT32_MAX) {
+    Serial.print("never");
+  } else {
+    Serial.print(linkAgeMs);
+    Serial.print("ms");
+  }
+  Serial.print(" | scale=");
+  Serial.print(distanceScaleIndex / 10.0f, 1);
+  Serial.print("x");
+  Serial.print(" vibe=");
+  Serial.print(intensityLabel(intensityMode));
+  Serial.print(" mode=");
+  Serial.print(feedbackLabel());
+  if (lastBatteryPct >= 0) {
+    Serial.print(" batt=");
+    Serial.print(lastBatteryVoltage, 2);
+    Serial.print("V/");
+    Serial.print(lastBatteryPct);
+    Serial.print("%");
+  }
+  Serial.println();
 }
 
 float readBatteryVoltage() {
-  digitalWrite(ADC_CTRL_PIN, HIGH);
-  delay(2);
   int mv = analogReadMilliVolts(ADC_BAT_PIN);
-  digitalWrite(ADC_CTRL_PIN, LOW);
   if (mv <= 0) {
     return 0.0f;
   }
@@ -712,155 +892,28 @@ int batteryPercentFromVoltage(float vbat) {
 }
 
 void updateBatteryDisplay(bool force) {
-  if (!displayOn) {
-    return;
-  }
   float vbat = readBatteryVoltage();
   if (vbat <= 0.1f) {
     return;
   }
   int pct = batteryPercentFromVoltage(vbat);
+  lastBatteryVoltage = vbat;
   if (!force && pct == lastBatteryPct) {
     return;
   }
   lastBatteryPct = pct;
-
-  char buf[6];
-  snprintf(buf, sizeof(buf), "%d%%", pct);
-  int len = (int)strlen(buf);
-  int textWidth = len * 6; // 6px per char at text size 1
-  int clearX = 160 - 40;
-  int x = 160 - textWidth;
-  if (x < clearX) {
-    x = clearX;
-  }
-
-  tft.fillRect(clearX, 0, 40, 12, ST77XX_BLACK);
-  tft.setTextSize(1);
-  tft.setCursor(x, 0);
-  tft.print(buf);
-}
-
-void setBitmapPixel(uint8_t* bitmap, uint16_t w, uint16_t x, uint16_t y) {
-  uint32_t index = x + (uint32_t)y * w;
-  uint32_t byteIndex = index >> 3;
-  uint8_t bit = 7 - (index & 0x7);
-  bitmap[byteIndex] |= (1 << bit);
-}
-
-void buildHumnLogoBitmap() {
-  if (humnLogoBuilt) {
-    return;
-  }
-  memset(humnLogoBitmap, 0, sizeof(humnLogoBitmap));
-
-  const int letterW = 22;
-  const int letterH = 24;
-  const int gap = 6;
-  const int thick = 3;
-  const int startX = (HUMN_LOGO_W - (letterW * 4 + gap * 3)) / 2;
-  const int startY = (HUMN_LOGO_H - letterH) / 2;
-
-  auto plot = [&](int x, int y) {
-    if (x < 0 || y < 0 || x >= (int)HUMN_LOGO_W || y >= (int)HUMN_LOGO_H) return;
-    setBitmapPixel(humnLogoBitmap, HUMN_LOGO_W, (uint16_t)x, (uint16_t)y);
-  };
-
-  auto drawRect = [&](int x, int y, int w, int h) {
-    for (int yy = y; yy < y + h; yy++) {
-      for (int xx = x; xx < x + w; xx++) {
-        plot(xx, yy);
-      }
-    }
-  };
-
-  auto drawH = [&](int x) {
-    drawRect(x, startY, thick, letterH);
-    drawRect(x + letterW - thick, startY, thick, letterH);
-    drawRect(x, startY + letterH / 2 - 1, letterW, thick);
-  };
-
-  auto drawU = [&](int x) {
-    drawRect(x, startY, thick, letterH - thick);
-    drawRect(x + letterW - thick, startY, thick, letterH - thick);
-    drawRect(x, startY + letterH - thick, letterW, thick);
-  };
-
-  auto drawM = [&](int x) {
-    drawRect(x, startY, thick, letterH);
-    drawRect(x + letterW - thick, startY, thick, letterH);
-    for (int y = 0; y < letterH; y++) {
-      int dx = (letterW - 2 * thick - 2) * y / (letterH - 1);
-      for (int t = 0; t < thick; t++) {
-        plot(x + thick + dx + t, startY + y);
-        plot(x + letterW - thick - 1 - dx - t, startY + y);
-      }
-    }
-  };
-
-  auto drawN = [&](int x) {
-    drawRect(x, startY, thick, letterH);
-    drawRect(x + letterW - thick, startY, thick, letterH);
-    for (int y = 0; y < letterH; y++) {
-      int dx = (letterW - thick - 1) * y / (letterH - 1);
-      for (int t = 0; t < thick; t++) {
-        plot(x + t + dx, startY + y);
-      }
-    }
-  };
-
-  int x0 = startX;
-  drawH(x0);
-  x0 += letterW + gap;
-  drawU(x0);
-  x0 += letterW + gap;
-  drawM(x0);
-  x0 += letterW + gap;
-  drawN(x0);
-
-  humnLogoBuilt = true;
 }
 
 void showHumnLogo() {
-  buildHumnLogoBitmap();
-  tft.fillScreen(ST77XX_BLACK);
-  int x = (160 - HUMN_LOGO_W) / 2;
-  int y = (80 - HUMN_LOGO_H) / 2;
-  tft.drawBitmap(x, y, humnLogoBitmap, HUMN_LOGO_W, HUMN_LOGO_H, ST77XX_WHITE);
+  if (Serial) {
+    Serial.println("HUMN");
+  }
 }
 
 void showSleepCat() {
-  tft.fillScreen(ST77XX_BLACK);
-  // Bigger sleeping cat using simple shapes
-  const int cx = 60;
-  const int cy = 44;
-  const int headR = 14;
-
-  // Body
-  tft.fillRoundRect(cx - 18, cy + 6, 60, 22, 10, ST77XX_WHITE);
-  tft.fillCircle(cx + 40, cy + 16, 10, ST77XX_WHITE);
-
-  // Head
-  tft.fillCircle(cx, cy, headR, ST77XX_WHITE);
-  tft.fillTriangle(cx - 12, cy - 8, cx - 2, cy - 22, cx - 2, cy - 6, ST77XX_WHITE);
-  tft.fillTriangle(cx + 12, cy - 8, cx + 2, cy - 22, cx + 2, cy - 6, ST77XX_WHITE);
-
-  // Face details (eyes closed + mouth)
-  tft.drawLine(cx - 6, cy - 2, cx - 1, cy - 2, ST77XX_BLACK);
-  tft.drawLine(cx + 1, cy - 2, cx + 6, cy - 2, ST77XX_BLACK);
-  tft.drawLine(cx - 1, cy + 2, cx + 1, cy + 2, ST77XX_BLACK);
-
-  // Tail curl
-  tft.drawCircle(cx + 50, cy + 18, 10, ST77XX_BLACK);
-  tft.drawCircle(cx + 50, cy + 18, 8, ST77XX_BLACK);
-
-  // "Zz"
-  tft.setTextSize(1);
-  tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
-  tft.setCursor(10, 8);
-  tft.print("Z");
-  tft.setCursor(20, 4);
-  tft.print("z");
+  if (Serial) {
+    Serial.println("Entering deep sleep.");
+  }
 }
 
 void playBootVibration() {
@@ -913,17 +966,10 @@ void enterDeepSleep() {
   }
   showSleepCat();
   delay(1000);
-  // Deep sleep is not light sleep mode (display timeout); clear the flag.
+  // Deep sleep is not light sleep mode; clear the flag.
   lightSleepMode = false;
   setDisplayOn(false);
-  digitalWrite(VEXT_CTRL, !VEXT_ACTIVE);
-  // Best-effort radio shutdown for maximum power savings.
-  // (WiFi/BLE are not used in normal operation, but explicitly disable anyway.)
-  WiFi.disconnect(true, true);
-  WiFi.mode(WIFI_OFF);
-  btStop();
-
-  esp_sleep_enable_ext0_wakeup((gpio_num_t)USER_BTN_PIN, USER_BTN_ACTIVE_LOW ? 0 : 1);
+  Serial.println("Wake with reset or power cycle.");
   esp_deep_sleep_start();
 }
 
@@ -1034,11 +1080,9 @@ void enterLightSleepWithCAD(uint32_t durationMs) {
 }
 
 void refreshDisplay() {
-  tft.fillScreen(ST77XX_BLACK);
-  tft.setTextWrap(false);
-  tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
-  tft.setTextSize(1);
-
+  if (Serial) {
+    Serial.println("Status refresh:");
+  }
   updateIntensityDisplay();
   updateFeedbackDisplay();
   updateSimDisplay();
@@ -1055,24 +1099,17 @@ void setDisplayOn(bool on, bool refresh) {
   }
   displayOn = on;
   if (on) {
-    // Exiting light sleep mode.
     lightSleepMode = false;
-    // Clear display before backlight to avoid stale flash
-    digitalWrite(VEXT_CTRL, VEXT_ACTIVE);
-    delay(50);
-    tft.initR(INITR_MINI160x80_PLUGIN);
-    tft.setRotation(1);
-    tft.fillScreen(ST77XX_BLACK);
-    tft.setTextWrap(false);
-    tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
-    tft.setTextSize(1);
-    digitalWrite(TFT_LED_K, HIGH);
+    if (Serial) {
+      Serial.println("Headless UI active.");
+    }
     if (refresh) {
       refreshDisplay();
     }
   } else {
-    digitalWrite(TFT_LED_K, LOW);
-    digitalWrite(VEXT_CTRL, !VEXT_ACTIVE);
+    if (Serial) {
+      Serial.println("Headless UI idle.");
+    }
   }
 }
 void flashStatusLed() {
@@ -1119,7 +1156,9 @@ void updateSimulatedDistance() {
       resetRssiAverager();
       currentHapticWindow = WIN_VERY_FAR;
       lastWindowDistanceFt = SIM_FAR_FT;
-      hapticTransitionReq.pending = false;
+      if (hapticTransitionReq.pattern != 2) {
+        hapticTransitionReq.pending = false;
+      }
       lastStep = 19;
       smoothedDistanceFt = SIM_FAR_FT;
     }
@@ -1168,6 +1207,74 @@ String buildReply() {
   return String(buf);
 }
 
+void runLoRaSelfTest() {
+  Serial.println("LoRa self-test:");
+  Serial.print("  Freq=");
+  Serial.print(LORA_FREQ_MHZ, 1);
+  Serial.print("MHz BW=");
+  Serial.print(LORA_BW_KHZ, 1);
+  Serial.print("kHz SF=");
+  Serial.print(LORA_SF);
+  Serial.print(" CR=4/");
+  Serial.print(LORA_CR);
+  Serial.print(" TX=");
+  Serial.print(LORA_TX_POWER);
+  Serial.println("dBm");
+
+  String packet = "T";
+  packet += String(deviceId, HEX);
+  packet.toUpperCase();
+
+  lora.setOutputPower(LORA_TX_POWER);
+  lora.standby();
+  uint32_t txStartMs = millis();
+  int txState = lora.transmit(packet);
+  uint32_t txMs = millis() - txStartMs;
+  Serial.print("  TX blocking @ ");
+  Serial.print(LORA_TX_POWER);
+  Serial.print("dBm: ");
+  if (txState == RADIOLIB_ERR_NONE) {
+    Serial.print("OK, ");
+    Serial.print(txMs);
+    Serial.println("ms");
+  } else {
+    Serial.print("failed, RadioLib code ");
+    Serial.println(txState);
+  }
+}
+
+void configureLoRaRadio() {
+  lora.setDio2AsRfSwitch();
+  lora.setBandwidth(LORA_BW_KHZ);
+  lora.setSpreadingFactor(LORA_SF);
+  lora.setCodingRate(LORA_CR);
+  lora.setOutputPower(LORA_TX_POWER);
+  lora.setSyncWord(LORA_SYNC_WORD);
+  lora.setCRC(true);
+}
+
+void recoverLoRaRadio(const char* reason, int state) {
+  if (Serial) {
+    Serial.print("LoRa recover after ");
+    Serial.print(reason);
+    Serial.print(": ");
+    Serial.println(state);
+  }
+  loraInterruptEnabled = false;
+  lora.reset();
+  delay(10);
+  int beginState = lora.begin(LORA_FREQ_MHZ);
+  if (beginState != RADIOLIB_ERR_NONE && Serial) {
+    Serial.print("LoRa recover begin failed: ");
+    Serial.println(beginState);
+  }
+  configureLoRaRadio();
+  lora.setDio1Action(setLoraFlag);
+  lora.startReceive();
+  loraRxFlag = false;
+  loraInterruptEnabled = true;
+}
+
 bool parsePeerId(const String& payload, uint32_t& outId) {
   if (payload.length() < 9) return false;
   char c0 = payload[0];
@@ -1186,6 +1293,9 @@ void updateRoleWithPeer(uint32_t otherId) {
     role = newRole;
     Serial.print("Role: ");
     Serial.println(role == ROLE_PINGER ? "PINGER" : "RESPONDER");
+    if (role == ROLE_PINGER) {
+      nextPingMs = millis() + random(20, 80);
+    }
   }
 }
 
@@ -1291,6 +1401,7 @@ void vibrationTask(void* parameter) {
           // Signature patterns:
           // - UP: 3 ascending chirps, then pulsed ramp-up (increasing frequency/duty)
           // - DOWN: 1 strong buzz, then sparse pulsed fade (decreasing frequency/duty)
+          // - SCALE: obvious confirmation buzzes for the salvaged Rev1 switch
           uint8_t intensity = 0;
 
           if (transitionPattern == 0) {
@@ -1320,7 +1431,7 @@ void vibrationTask(void* parameter) {
               bool gateOn = (cycle < duty);
               intensity = gateOn ? base : 0;
             }
-          } else {
+          } else if (transitionPattern == 1) {
             // Ramp-down: strong buzz then sparse fade
             if (elapsed < 220) {
               // strong buzz start: 140ms on, 80ms off
@@ -1336,6 +1447,11 @@ void vibrationTask(void* parameter) {
               bool gateOn = (cycle < duty);
               intensity = gateOn ? base : 0;
             }
+          } else {
+            // Scale-change cue: tactile "ping" -- sharp attack, quick decay.
+            float decay = (1.0f - t);
+            float shaped = decay * decay;
+            intensity = lerpU8(0, transitionTo, shaped);
           }
 
           drv.setRealtimeValue(intensity);
@@ -1355,6 +1471,10 @@ void vibrationTask(void* parameter) {
         transitionStartMs = now;
         transitionEndMs = now + (dur == 0 ? 1 : dur);
         transitionActive = true;
+        if (Serial && transitionPattern == 2) {
+          Serial.print("Scale haptic cue started: intensity=");
+          Serial.println(transitionTo);
+        }
         // Cancel any scheduled pulsing edge so the transition is crisp.
         nextVibeToggleMs = now;
         motorStopMs = 0;
@@ -1407,24 +1527,11 @@ void vibrationTask(void* parameter) {
 }
 
 void setup() {
-  // Bring up the display ASAP so the HUMN logo appears immediately on boot.
-  // Keep backlight off while drawing to avoid a "flash" of uninitialized pixels.
-  pinMode(VEXT_CTRL, OUTPUT);
-  digitalWrite(VEXT_CTRL, VEXT_ACTIVE);  // Powers TFT + GNSS rail
-  pinMode(TFT_LED_K, OUTPUT);
-  digitalWrite(TFT_LED_K, LOW);          // Backlight off while initializing
-  delay(50);
-
-  tft.initR(INITR_MINI160x80_PLUGIN);
-  tft.setRotation(1);
-  tft.fillScreen(ST77XX_BLACK);
-  showHumnLogo();
-  digitalWrite(TFT_LED_K, HIGH);         // Backlight on once logo is drawn
   displayOn = true;
   lightSleepMode = false;
   lastUserInteractionMs = millis();
 
-  // Initialize Serial - using USB CDC on ESP32-S3
+  // Initialize Serial over native USB CDC on the ESP32-C6.
   Serial.begin(115200);
   Serial.setDebugOutput(false);
   while (!Serial && millis() < 5000) {
@@ -1433,8 +1540,9 @@ void setup() {
   delay(300);
 
   Serial.println("\n\n========================================");
-  Serial.println("  Wireless Tracker - TFT + LoRa");
+  Serial.println("  Humn custom PCB - ESP32-C6 + SX1262");
   Serial.println("========================================\n");
+  showHumnLogo();
   printBootReason();
 
   // Reduce ESP-IDF/Arduino core log noise (prevents USB-serial ISR overload -> INT_WDT).
@@ -1453,37 +1561,39 @@ void setup() {
   prefs.begin("humn", false);
   loadSettings();
 
-  // Hold GNSS in reset (we don't use it)
-  pinMode(GNSS_RST_PIN, OUTPUT);
-  digitalWrite(GNSS_RST_PIN, LOW);
-
   // Setup user button
   pinMode(USER_BTN_PIN, INPUT_PULLUP);
+  pinMode(MODE_SWITCH_ADC_PIN, INPUT);
 
   // Setup battery ADC
-  pinMode(ADC_CTRL_PIN, OUTPUT);
-  digitalWrite(ADC_CTRL_PIN, LOW);
   analogReadResolution(12);
   analogSetPinAttenuation(ADC_BAT_PIN, ADC_11db);
+  if (MODE_SWITCH_ANALOG_ENABLED) {
+    analogSetPinAttenuation(MODE_SWITCH_ADC_PIN, ADC_11db);
+  }
+  applyModeSwitchScale(true);
 
   // Setup status LED
-  pinMode(STATUS_LED_PIN, OUTPUT);
-  digitalWrite(STATUS_LED_PIN, LOW);
+  if (LED_ENABLED && STATUS_LED_PIN >= 0) {
+    pinMode(STATUS_LED_PIN, OUTPUT);
+    digitalWrite(STATUS_LED_PIN, LOW);
+  }
+
+  // Enable the DRV2605L and keep its external trigger input inactive.
+  pinMode(HAPTIC_EN_PIN, OUTPUT);
+  digitalWrite(HAPTIC_EN_PIN, HIGH);
+  pinMode(HAPTIC_TRIG_PIN, OUTPUT);
+  digitalWrite(HAPTIC_TRIG_PIN, LOW);
+  delay(10);
 
   // Initialize LoRa radio
   spiLoRa.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
   int state = lora.begin(LORA_FREQ_MHZ);
-  lora.setDio2AsRfSwitch();
-  lora.setTCXO(1.6);
-  lora.setBandwidth(LORA_BW_KHZ);
-  lora.setSpreadingFactor(LORA_SF);
-  lora.setCodingRate(LORA_CR);
-  lora.setOutputPower(LORA_TX_POWER);
-  lora.setSyncWord(LORA_SYNC_WORD);
-  lora.setCRC(true);
+  configureLoRaRadio();
 
   if (state == RADIOLIB_ERR_NONE) {
     Serial.println("LoRa init OK.");
+    runLoRaSelfTest();
   } else {
     Serial.print("LoRa init failed: ");
     Serial.println(state);
@@ -1492,34 +1602,22 @@ void setup() {
   lora.setDio1Action(setLoraFlag);
   lora.startReceive();
 
-  // Setup DRV2605L (I2C) - try primary bus (4/5), then alternate (16/17) if needed
-  struct { int sda; int scl; } i2cBuses[] = {
-    { I2C_SDA_PRIMARY,   I2C_SCL_PRIMARY   },
-    { I2C_SDA_ALTERNATE, I2C_SCL_ALTERNATE }
-  };
-  for (size_t b = 0; b < sizeof(i2cBuses) / sizeof(i2cBuses[0]) && !drvOk; b++) {
-    Wire.end();
-    Wire.begin(i2cBuses[b].sda, i2cBuses[b].scl);
-    drvOk = drv.begin();
-    if (drvOk) {
-      drv.selectLibrary(1);
-      drv.setMode(DRV2605_MODE_REALTIME);
-      drv.setRealtimeValue(0);
-      Serial.println("DRV2605L init OK.");
-      Serial.print("DRV2605L I2C pins: SDA=");
-      Serial.print(i2cBuses[b].sda);
-      Serial.print(" SCL=");
-      Serial.println(i2cBuses[b].scl);
-      Serial.println("Button cycles intensity: soft/medium/hard/max");
-    } else {
-      Serial.print("DRV2605L not found on SDA=");
-      Serial.print(i2cBuses[b].sda);
-      Serial.print(" SCL=");
-      Serial.println(i2cBuses[b].scl);
-    }
+  // Setup DRV2605L (I2C)
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  drvOk = drv.begin();
+  if (drvOk) {
+    drv.selectLibrary(1);
+    drv.setMode(DRV2605_MODE_REALTIME);
+    drv.setRealtimeValue(0);
+    Serial.println("DRV2605L init OK.");
+    Serial.print("DRV2605L I2C pins: SDA=");
+    Serial.print(I2C_SDA_PIN);
+    Serial.print(" SCL=");
+    Serial.println(I2C_SCL_PIN);
+    Serial.println("Button cycles intensity: soft/medium/hard/max");
   }
   if (!drvOk) {
-    Serial.println("DRV2605L init FAILED on both I2C buses.");
+    Serial.println("DRV2605L init FAILED.");
     Serial.println("Check wiring + power. DRV2605L addr is 0x5A or 0x5B.");
   }
 
@@ -1572,7 +1670,7 @@ void loop() {
       smoothedDistanceFt = DIST_SMOOTH_ALPHA * distFt + (1.0f - DIST_SMOOTH_ALPHA) * smoothedDistanceFt;
       int step = estimateDistanceStep((int16_t)round(smoothedRssi));
       rxCounter++;
-      if (rxCounter % rxLogEvery == 0) {
+      if (verboseTimingLogs && rxCounter % rxLogEvery == 0) {
         Serial.print("RSSI=");
         Serial.print(lastRssi);
         Serial.print(" dBm SNR=");
@@ -1589,18 +1687,15 @@ void loop() {
       recordRssiSample(lastRssi, lastRxMs);
       updateHapticWindowFromAvgRssi(lastRxMs);
 
-      // No TFT updates on every RX to reduce jitter
+      // Avoid chatty serial updates on every RX to reduce jitter.
 
       uint32_t otherId = 0;
       if (parsePeerId(payload, otherId)) {
         updateRoleWithPeer(otherId);
       }
 
-      if (payload.startsWith("P")) {
-        // Respond to ping
-        String reply = buildReply();
-        lora.transmit(reply);
-      }
+      // No immediate reply here. The custom boards use periodic beacons from
+      // both sides to avoid SX1262 half-duplex TX/RX contention.
 
       flashStatusLed();
 
@@ -1629,6 +1724,11 @@ void loop() {
   bool btnPressed = digitalRead(USER_BTN_PIN) == (USER_BTN_ACTIVE_LOW ? LOW : HIGH);
 
   uint32_t nowMs = millis();
+  if (nowMs - lastModeSwitchReadMs >= MODE_SWITCH_READ_MS) {
+    lastModeSwitchReadMs = nowMs;
+    applyModeSwitchScale(false);
+  }
+
   bool pressedEdge = btnPressed && !lastBtnState && (nowMs - lastBtnMs > BTN_DEBOUNCE_MS);
   if (pressedEdge) {
     lastBtnMs = nowMs;
@@ -1654,7 +1754,8 @@ void loop() {
       btnHoldHandled = true;
       do {
         uiSetting = (uiSetting + 1) % 5;
-      } while (uiSetting == UI_PING);
+      } while (uiSetting == UI_PING || uiSetting == UI_SCALE ||
+               (!SIMULATION_MODE_ENABLED && uiSetting == UI_SIM));
 
       if (verboseUiLogs && Serial) {
         Serial.print("Edit setting: ");
@@ -1705,6 +1806,12 @@ void loop() {
         updateFeedbackDisplay();
         saveSettings();
       } else if (uiSetting == UI_SIM) {
+        if (!SIMULATION_MODE_ENABLED) {
+          simulateDistance = false;
+          updateSimDisplay();
+          saveSettings();
+          return;
+        }
         simulateDistance = !simulateDistance;
         if (verboseUiLogs && Serial) {
           Serial.print("Sim mode: ");
@@ -1712,17 +1819,6 @@ void loop() {
         }
 
         updateSimDisplay();
-        saveSettings();
-      } else {
-        // Distance scale: 1.0x .. 3.0x in 0.1 steps
-        distanceScaleIndex++;
-        if (distanceScaleIndex > 30) distanceScaleIndex = 10;
-        if (verboseUiLogs && Serial) {
-          Serial.print("Scale: ");
-          Serial.print(distanceScaleIndex / 10.0f, 1);
-          Serial.println("x");
-        }
-        updateScaleDisplay();
         saveSettings();
       }
 
@@ -1748,8 +1844,8 @@ void loop() {
     nextPingMs = now + effectivePingBaseMs + random(0, effectivePingJitterMs);
   }
 
-  // Warn if we're late sending a ping (only when we are supposed to ping)
-  if (role != ROLE_RESPONDER && nextPingMs != 0 && now > nextPingMs + PING_LATE_WARN_MS) {
+  // Warn if we're late sending a beacon.
+  if (nextPingMs != 0 && now > nextPingMs + PING_LATE_WARN_MS) {
     // Throttle this log heavily; at fast ping rates it can create a feedback loop
     // (printing makes loop slower => always "late" => prints constantly => WDT).
     if (verboseTimingLogs && displayOn && Serial &&
@@ -1775,7 +1871,9 @@ void loop() {
     currentHapticWindow = WIN_VERY_FAR;
     lastWindowDistanceFt = SIM_FAR_FT;
     smoothedDistanceFt = SIM_FAR_FT;
-    hapticTransitionReq.pending = false;
+    if (hapticTransitionReq.pattern != 2) {
+      hapticTransitionReq.pending = false;
+    }
     updateDistanceDisplay(lastStep);
   }
 
@@ -1783,20 +1881,28 @@ void loop() {
     // In SEARCH mode, avoid pinging right after RX to reduce collisions
     if (role == ROLE_SEARCH && now - lastSignalMs < 400) {
       nextPingMs = now + effectivePingBaseMs + random(0, effectivePingJitterMs);
-    } else if (role == ROLE_SEARCH || role == ROLE_PINGER) {
+    } else {
       pingCounter++;
 
       String msg = buildPing();
 
       loraInterruptEnabled = false;
       uint32_t txStartMs = millis();
-      lora.transmit(msg);
+      int txState = lora.transmit(msg);
       uint32_t txDurMs = millis() - txStartMs;
       lora.startReceive();
       loraInterruptEnabled = true;
 
-      // No TFT updates on every TX to reduce jitter
+      // Avoid chatty serial updates on every TX to reduce jitter.
       flashStatusLed();
+
+      if (txState != RADIOLIB_ERR_NONE) {
+        if (Serial) {
+          Serial.print("Ping TX failed: ");
+          Serial.println(txState);
+        }
+        recoverLoRaRadio("beacon TX", txState);
+      }
 
       if (verboseTimingLogs && displayOn && Serial &&
           lastPingSentMs != 0 && (pingCounter % pingIntervalLogEvery == 0)) {
